@@ -2,9 +2,11 @@
   "name": "@unblocklabs/skill-usage-audit",
   "version": "0.4.0",
   "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
-  "openclaw.extensions": [
-    "index.ts"
-  ],
+  "openclaw": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
   "keywords": [
     "openclaw",
     "plugin",
