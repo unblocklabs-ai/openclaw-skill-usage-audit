@@ -1,0 +1,36 @@
+{
+  "name": "@unblocklabs/skill-usage-audit",
+  "version": "0.4.0",
+  "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
+  "openclaw.extensions": [
+    "index.ts"
+  ],
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "skill-audit",
+    "telemetry",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/bill492/openclaw-skill-usage-audit",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bill492/openclaw-skill-usage-audit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bill492/openclaw-skill-usage-audit/issues"
+  },
+  "author": "Unblock Labs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "evaluate-skill-health.mjs",
+    "README.md"
+  ]
+}
