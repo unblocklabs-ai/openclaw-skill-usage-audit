@@ -15,13 +15,13 @@
     "sqlite"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/bill492/openclaw-skill-usage-audit",
+  "homepage": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bill492/openclaw-skill-usage-audit.git"
+    "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git"
   },
   "bugs": {
-    "url": "https://github.com/bill492/openclaw-skill-usage-audit/issues"
+    "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit/issues"
   },
   "author": "Unblock Labs",
   "engines": {
