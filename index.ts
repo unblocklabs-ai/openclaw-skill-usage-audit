@@ -3,7 +3,7 @@
  */
 
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
-import { dirname, basename, resolve, join, relative } from "node:path";
+import { dirname, basename, resolve, join, relative, sep } from "node:path";
 
 import { createHash } from "node:crypto";
 
@@ -17,6 +17,16 @@ const DEFAULT_CONTEXT_WINDOW_SIZE = 5;
 const DEFAULT_CONTEXT_TIMEOUT_MS = 60000;
 const MAX_MESSAGE_LEN = 200;
 const MAX_HISTORY_PER_SCOPE = 80;
+
+const DEFAULT_ROUTER_MAX_SKILLS = 1;
+const DEFAULT_ROUTER_MIN_SCORE = 6;
+const DEFAULT_ROUTER_RECENCY_WINDOW = 10;
+const ROUTER_CACHE_TTL_MS = 60_000;
+const ROUTER_FRONTMATTER_MAX_LINES = 55;
+
+const MESSAGE_HISTORY_STALE_MS = 30 * 60 * 1000;
+const MESSAGE_HISTORY_CLEANUP_EVERY = 100;
+const MESSAGE_HISTORY_MAX_SCOPES = 500;
 
 const DEFAULT_REDACT_KEYS = [
   "token",
@@ -68,6 +78,40 @@ interface PluginConfig {
   skillBlockDetection?: boolean;
   contextWindowSize?: unknown;
   contextTimeoutMs?: unknown;
+  router?: RouterConfig;
+}
+
+interface RouterConfig {
+  enabled?: unknown;
+  targets?: {
+    subagent?: unknown;
+    cron?: unknown;
+  };
+  maxSkillsToNudge?: unknown;
+  minScore?: unknown;
+  recencyWindow?: unknown;
+  overrides?: unknown;
+  skillKeywords?: unknown;
+  blocklist?: unknown;
+}
+
+interface RouterOverride {
+  taskPattern: string;
+  skills: string[];
+  matcher?: RegExp;
+}
+
+interface SkillCandidate {
+  name: string;
+  description: string;
+  filePath: string;
+}
+
+interface SkillCandidateCache {
+  fetchedAt: number;
+  candidates: SkillCandidate[];
+  idf: Map<string, number>;
+  avgDescLen: number;
 }
 
 interface RawContext {
@@ -96,6 +140,11 @@ interface MessageCapture {
   signalLabels?: string[];
 }
 
+interface MessageHistoryEntry {
+  messages: MessageCapture[];
+  lastSeenAt: number;
+}
+
 type ImpliedOutcome = "positive" | "negative" | "unclear";
 
 interface SkillExecutionState {
@@ -118,6 +167,7 @@ interface SkillExecutionState {
   followupMessages: MessageCapture[];
 
   toolReadCount: number;
+  skillReadCount: number;
   encounteredSkillPaths: Set<string>;
   sameSkillRetried: boolean;
   fallbackSkillRetried: boolean;
@@ -153,6 +203,7 @@ interface DbPrepared {
   getLatestSkillVersion: (params: Record<string, unknown>) => { version_hash?: string } | undefined;
   insertExecution: (params: Record<string, unknown>) => void;
   insertFeedback: (params: Record<string, unknown>) => void;
+  insertNudge: (params: Record<string, unknown>) => void;
 }
 
 interface DbState {
@@ -188,6 +239,21 @@ function parseIntConfig(value: unknown, fallback: number, min?: number): number 
   if (!Number.isFinite(parsed)) return fallback;
   if (min !== undefined && parsed < min) return fallback;
   return parsed;
+}
+
+function parseFloatConfig(value: unknown, fallback: number, min?: number): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : Number.parseFloat(typeof value === "string" ? value.trim() : "");
+
+  if (!Number.isFinite(parsed)) return fallback;
+  if (min !== undefined && parsed < min) return fallback;
+  return parsed;
+}
+
+function parseBooleanConfig(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 function normalizeText(value: unknown, redactKeys: Set<string>): string {
@@ -421,6 +487,408 @@ function buildMessageScope(ctx: RawContext | undefined, event: RawEvent | undefi
   return scopeCandidates.find((key) => key.startsWith("conv:")) || scopeCandidates.find((key) => key.startsWith("acct:")) || scopeCandidates[0];
 }
 
+const workspaceSkillCache = new Map<string, SkillCandidateCache>();
+
+function resolveWorkspaceDir(): string {
+  const extDir = resolve(__dirname);
+  const marker = `${sep}.openclaw${sep}`;
+  const markerIdx = extDir.indexOf(marker);
+  if (markerIdx >= 0) {
+    const candidate = extDir.slice(0, markerIdx);
+    return candidate || process.cwd();
+  }
+  return process.cwd();
+}
+
+function parseRouterTextArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+}
+
+function parseSkillKeywords(value: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+
+  const obj = value as Record<string, unknown>;
+  for (const [key, val] of Object.entries(obj)) {
+    const parsed = parseRouterTextArray(val);
+    if (parsed.length) {
+      out[key.toLowerCase()] = parsed;
+    }
+  }
+  return out;
+}
+
+function parseOverrideRules(value: unknown): RouterOverride[] {
+  if (!Array.isArray(value)) return [];
+
+  const out: RouterOverride[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const pattern = toStringLike((entry as Record<string, unknown>).taskPattern);
+    const skills = parseRouterTextArray((entry as Record<string, unknown>).skills);
+    if (pattern && skills.length) {
+      out.push({ taskPattern: pattern, skills });
+    }
+  }
+  return out;
+}
+
+function parseBlocklist(value: unknown): string[] {
+  return parseRouterTextArray(value).map((item) => item.toLowerCase());
+}
+
+function normalizePathForDisplay(filePath: string): string {
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (home && filePath.startsWith(home)) {
+    return `~${filePath.slice(home.length)}`;
+  }
+  return filePath;
+}
+
+function getTextFromMessage(message: unknown): string | undefined {
+  if (typeof message === "string") return message;
+  if (!message || typeof message !== "object") return undefined;
+
+  const msg = message as Record<string, unknown>;
+  if (typeof msg.content === "string") return msg.content;
+  if (msg.content && typeof msg.content === "object") {
+    const nested = msg.content as Record<string, unknown>;
+    if (typeof nested.text === "string") return nested.text;
+  }
+  if (typeof msg.text === "string") return msg.text;
+  if (typeof msg.body === "string") return msg.body;
+  if (typeof msg.message === "string") return msg.message;
+  return undefined;
+}
+
+function extractToolNameFromMessage(message: unknown): string | undefined {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+
+  const msg = message as Record<string, unknown>;
+  return (
+    toStringLike(msg.toolName) ||
+    toStringLike(msg.tool_name) ||
+    toStringLike(msg.tool)
+  )?.toLowerCase();
+}
+
+function normalizeCandidatePath(value: string): string {
+  const raw = value
+    .replace(/\\/g, "/")
+    .replace(/["'`(){}\[\]]/g, "");
+
+  const expanded = raw.startsWith("~") ? resolveHomePath(raw) : raw;
+  return expanded
+    .trim()
+    .replace(/[#?].*$/, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .toLowerCase();
+}
+
+
+function extractReadPathsFromToolMessage(message: unknown): string[] {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return [];
+
+  const toolName = extractToolNameFromMessage(message);
+  if (toolName !== "read") return [];
+
+  const msg = message as Record<string, unknown>;
+  const params =
+    msg.params && typeof msg.params === "object" && !Array.isArray(msg.params)
+      ? msg.params as Record<string, unknown>
+      : undefined;
+
+  const out: string[] = [];
+
+  const collect = (value: unknown) => {
+    const text = toStringLike(value);
+    if (text) out.push(text);
+  };
+
+  if (params) {
+    collect(params.path);
+  }
+
+  return out;
+}
+
+function wasSkillHandledRecently(messages: unknown[], skillName: string, skillFilePath: string, recencyWindow: number): boolean {
+  if (!messages.length || recencyWindow <= 0) return false;
+
+  const lookback = Math.max(1, Math.min(messages.length, recencyWindow));
+  const start = messages.length - lookback;
+  const normalizedSkillPath = normalizeCandidatePath(skillFilePath);
+  const skillSuffix = `/${skillName.toLowerCase()}/skill.md`;
+
+  for (let i = messages.length - 1; i >= start; i--) {
+    const message = messages[i];
+    const text = getTextFromMessage(message);
+
+    if (text && text.includes("[skill-router]") && text.includes(`→ ${skillName}:`)) {
+      return true;
+    }
+
+    const candidatePaths = extractReadPathsFromToolMessage(message);
+    for (const candidate of candidatePaths) {
+      const normalized = normalizeCandidatePath(candidate);
+      if (!normalized) continue;
+
+      if ((normalized === normalizedSkillPath) || normalized.endsWith(skillSuffix)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function messageIndexForTask(messages: unknown[], prompt: string): number | null {
+  if (!messages.length) return null;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const text = getTextFromMessage(messages[i]);
+    if (typeof text === "string" && text === prompt) {
+      return i;
+    }
+  }
+  return messages.length - 1;
+}
+
+function parseFrontmatterFromSkillMd(content: string): { name?: string; description?: string } | null {
+  const lines = content.split(/\r?\n/).slice(0, ROUTER_FRONTMATTER_MAX_LINES);
+  if (!lines.length || lines[0]?.trim() !== "---") return null;
+
+  const out: { [k: string]: string } = {};
+  for (let i = 1; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (line === "---") break;
+    if (!line || line.startsWith("#")) continue;
+
+    const colon = line.indexOf(":");
+    if (colon < 0) continue;
+
+    const key = line.slice(0, colon).trim().toLowerCase();
+    let value = line.slice(colon + 1).trim();
+    if (!key || !value) continue;
+
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    out[key] = value;
+  }
+
+  if (!Object.keys(out).length) return null;
+  return {
+    name: out.name,
+    description: out.description,
+  };
+}
+
+async function collectSkillCandidatesFromRoot(root: string): Promise<SkillCandidate[]> {
+  const out: SkillCandidate[] = [];
+
+  let entries: Awaited<ReturnType<typeof readdir>>;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const dirPath = resolve(root, entry.name);
+    const skillPath = resolve(dirPath, "SKILL.md");
+    try {
+      const statResult = await stat(skillPath);
+      if (!statResult.isFile()) continue;
+    } catch {
+      continue;
+    }
+
+    let frontmatter: { name?: string; description?: string } | null = null;
+    try {
+      const raw = await readFile(skillPath, "utf8");
+      frontmatter = parseFrontmatterFromSkillMd(raw);
+    } catch {
+      continue;
+    }
+
+    const name = (frontmatter?.name || entry.name).trim();
+    if (!name) continue;
+
+    out.push({
+      name,
+      description: frontmatter?.description || "",
+      filePath: skillPath,
+    });
+  }
+
+  return out;
+}
+
+async function loadSkillCandidatesForWorkspace(workspaceDir: string): Promise<SkillCandidateCache> {
+  const now = Date.now();
+  const cached = workspaceSkillCache.get(workspaceDir);
+  if (cached && now - cached.fetchedAt < ROUTER_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  const roots = [
+    resolve(workspaceDir, "skills"),
+    resolveHomePath("~/.openclaw/skills"),
+  ];
+
+  const bundleRoot = (() => {
+    try {
+      const packagePath = require.resolve("openclaw/package.json");
+      return resolve(dirname(packagePath), "skills");
+    } catch {
+      return undefined;
+    }
+  })();
+
+  if (bundleRoot) {
+    roots.push(bundleRoot);
+  }
+
+  const seen = new Map<string, { priority: number; candidate: SkillCandidate }>();
+
+  for (let r = 0; r < roots.length; r += 1) {
+    const root = roots[r];
+    const candidates = await collectSkillCandidatesFromRoot(root);
+
+    for (const candidate of candidates) {
+      const key = candidate.name.toLowerCase();
+      const existing = seen.get(key);
+      if (!existing || existing.priority > r) {
+        seen.set(key, { priority: r, candidate });
+      }
+    }
+  }
+
+  const candidates = [...seen.values()].map((entry) => entry.candidate);
+
+  // Build BM25 IDF table from skill descriptions
+  const { idf, avgDescLen } = buildIdfTable(candidates);
+
+  const cacheEntry: SkillCandidateCache = { fetchedAt: now, candidates, idf, avgDescLen };
+  workspaceSkillCache.set(workspaceDir, cacheEntry);
+  return cacheEntry;
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[.,;:!?\'"()\[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length > 2);
+}
+
+function buildIdfTable(candidates: SkillCandidate[]): { idf: Map<string, number>; avgDescLen: number } {
+  const N = candidates.length;
+  const docFreq = new Map<string, number>();
+  let totalDescLen = 0;
+
+  for (const candidate of candidates) {
+    const tokens = new Set(tokenize(candidate.description));
+    totalDescLen += tokens.size;
+    for (const token of tokens) {
+      docFreq.set(token, (docFreq.get(token) || 0) + 1);
+    }
+  }
+
+  const idf = new Map<string, number>();
+  for (const [term, df] of docFreq) {
+    // Standard BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+    idf.set(term, Math.log((N - df + 0.5) / (df + 0.5) + 1));
+  }
+
+  return { idf, avgDescLen: N > 0 ? totalDescLen / N : 1 };
+}
+
+function scoreSkill(
+  taskText: string,
+  skill: { name: string; description: string },
+  keywords: Record<string, string[]>,
+  idf: Map<string, number>,
+  avgDescLen: number,
+) {
+  const taskTokens = tokenize(taskText);
+  const descTokens = tokenize(skill.description);
+
+  let score = 0;
+  let reason = "";
+
+  // Name match bonus (still valuable — distinctive signal)
+  if (taskText.toLowerCase().includes(skill.name.toLowerCase())) {
+    score += 10;
+    reason = "name_match";
+  }
+
+  // BM25 scoring: how well does the task text match this skill's description?
+  // Parameters: k1 controls term frequency saturation, b controls length normalization
+  const k1 = 1.5;
+  const b = 0.75;
+  const dl = descTokens.length || 1;
+  const avgdl = avgDescLen || 1;
+
+  // Build term frequency map for the description
+  const descTf = new Map<string, number>();
+  for (const token of descTokens) {
+    descTf.set(token, (descTf.get(token) || 0) + 1);
+  }
+
+  // Score each query (task) term against the description document
+  let bm25 = 0;
+  for (const term of new Set(taskTokens)) {
+    const tf = descTf.get(term) || 0;
+    if (tf === 0) continue;
+
+    const termIdf = idf.get(term) || 0;
+    const numerator = tf * (k1 + 1);
+    const denominator = tf + k1 * (1 - b + b * (dl / avgdl));
+    bm25 += termIdf * (numerator / denominator);
+  }
+
+  score += bm25;
+  if (bm25 > 0 && !reason) reason = "bm25";
+
+  // Config keyword hits (+5 per keyword — manual boost for known associations)
+  const skillKeywords = keywords[skill.name.toLowerCase()] || [];
+  for (const kw of skillKeywords) {
+    if (taskText.toLowerCase().includes(kw.toLowerCase())) {
+      score += 5;
+      if (!reason) reason = "keyword_match";
+    }
+  }
+
+  return { score, reason: reason || "none" };
+}
+
+function formatNudge(skills: SkillCandidate[]): string {
+  const noun = skills.length === 1 ? "this skill" : "these skills";
+  const lines = [
+    `[skill-router] Based on your current task, you likely need ${noun}:`,
+  ];
+
+  for (const skill of skills) {
+    const desc = (skill.description || "").replace(/\s+/g, " ").trim();
+    lines.push(`  → ${skill.name}: "${desc || "No description available."}"`);
+    lines.push(`    Location: ${normalizePathForDisplay(skill.filePath)}`);
+    lines.push("    Read it with the read tool before proceeding.");
+  }
+
+  return lines.join("\n");
+}
+
 function createPreparedStatements(db: SqliteBackend): DbPrepared {
   const insertEvent = db.prepare(`
     INSERT INTO skill_events (
@@ -520,6 +988,30 @@ function createPreparedStatements(db: SqliteBackend): DbPrepared {
     VALUES (@execution_id, @source, @label, @notes)
   `);
 
+  const insertNudge = db.prepare(`
+    INSERT INTO skill_nudges (
+      session_key,
+      session_id,
+      agent_id,
+      skill_name,
+      skill_path,
+      score,
+      match_reason,
+      turn_number,
+      task_excerpt
+    ) VALUES (
+      @session_key,
+      @session_id,
+      @agent_id,
+      @skill_name,
+      @skill_path,
+      @score,
+      @match_reason,
+      @turn_number,
+      @task_excerpt
+    )
+  `);
+
   return {
     insertEvent: (params) => {
       try {
@@ -548,6 +1040,13 @@ function createPreparedStatements(db: SqliteBackend): DbPrepared {
     getLatestSkillVersion: (params) => getLatestSkillVersion.get(params) as { version_hash?: string } | undefined,
     insertExecution: (params) => insertExecution.run(params),
     insertFeedback: (params) => insertFeedback.run(params),
+    insertNudge: (params) => {
+      try {
+        insertNudge.run(params);
+      } catch {
+        // best effort
+      }
+    },
   };
 }
 
@@ -698,6 +1197,24 @@ async function initSqlite(path: string, log: { info: (msg: string) => void; erro
       notes TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS skill_nudges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_key TEXT,
+      session_id TEXT,
+      agent_id TEXT,
+      skill_name TEXT NOT NULL,
+      skill_path TEXT,
+      score REAL,
+      match_reason TEXT,
+      turn_number INTEGER,
+      task_excerpt TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_nudges_session ON skill_nudges(session_key);
+    CREATE INDEX IF NOT EXISTS idx_nudges_skill ON skill_nudges(skill_name);
+    CREATE INDEX IF NOT EXISTS idx_nudges_time ON skill_nudges(timestamp);
   `);
 
   log.info(`skill-usage-audit: sqlite initialized at ${path} (${backend.kind})`);
@@ -756,6 +1273,26 @@ export default function register(api: OpenClawPluginApi) {
   const detectSkillBlocks = cfg.skillBlockDetection !== false;
   const dbPath = resolveDbPath(cfg.dbPath);
 
+  const routerConfig = cfg.router || {} as RouterConfig;
+  const routerEnabled = parseBooleanConfig(routerConfig.enabled, true);
+  const routerTargets = routerConfig.targets || {};
+  const routerTargetSubagent = parseBooleanConfig(routerTargets.subagent, true);
+  const routerTargetCron = parseBooleanConfig(routerTargets.cron, true);
+  const routerMaxSkillsToNudge = parseIntConfig(routerConfig.maxSkillsToNudge, DEFAULT_ROUTER_MAX_SKILLS, 1);
+  const routerMinScore = parseFloatConfig(routerConfig.minScore, DEFAULT_ROUTER_MIN_SCORE, 0);
+  const routerRecencyWindow = parseIntConfig(routerConfig.recencyWindow, DEFAULT_ROUTER_RECENCY_WINDOW, 1);
+  const routerOverrides = parseOverrideRules(routerConfig.overrides).map((entry) => {
+    try {
+      return { ...entry, matcher: new RegExp(entry.taskPattern, "i") };
+    } catch (error) {
+      log.error(`skill-usage-audit: invalid override taskPattern: ${String(entry.taskPattern)} (${String(error)})`);
+      return undefined;
+    }
+  }).filter((entry): entry is RouterOverride & { matcher: RegExp } => Boolean(entry));
+  const routerSkillKeywords = parseSkillKeywords(routerConfig.skillKeywords);
+  const routerBlocklist = new Set(parseBlocklist(routerConfig.blocklist));
+  const pluginWorkspaceDir = resolveWorkspaceDir();
+
   const dbState: DbState = { backend: null, statements: null };
   const dbInitPromise = initSqlite(dbPath, log);
   let dbChain = Promise.resolve<void>(undefined);
@@ -764,7 +1301,9 @@ export default function register(api: OpenClawPluginApi) {
   let shutdownInProgress = false;
   let shutdownPromise: Promise<void> | null = null;
 
-  const messageHistory = new Map<string, MessageCapture[]>();
+  const messageHistory = new Map<string, MessageHistoryEntry>();
+  let messageHistoryCounter = 0;
+
   const executionsById = new Map<number, SkillExecutionState>();
   const execByScope = new Map<string, SkillExecutionState[]>();
   const execByTool = new Map<string, number>();
@@ -863,24 +1402,89 @@ export default function register(api: OpenClawPluginApi) {
       });
   }
 
+  function queueNudgeInsert(params: {
+    event: RawEvent;
+    ctx: RawContext | undefined;
+    skillName: string;
+    skillPath: string | undefined;
+    score: number;
+    matchReason: string;
+    turnNumber: number | null;
+    taskExcerpt: string;
+  }): void {
+    dbChain = dbChain
+      .then(async () => {
+        const state = await ensureDbReady();
+        if (!state.statements) return;
+
+        const base = buildBase(params.event as { sessionId?: string; runId?: string }, params.ctx);
+        state.statements.insertNudge({
+          session_key: base.sessionKey || null,
+          session_id: base.sessionId || null,
+          agent_id: base.agentId || null,
+          skill_name: params.skillName,
+          skill_path: params.skillPath || null,
+          score: params.score,
+          match_reason: params.matchReason,
+          turn_number: params.turnNumber,
+          task_excerpt: params.taskExcerpt,
+        });
+      })
+      .catch((err) => {
+        log.error(`skill-usage-audit: failed writing nudge: ${String(err)}`);
+      });
+  }
+
+  function cleanupMessageHistory(): void {
+    const now = Date.now();
+
+    for (const [scope, entry] of messageHistory.entries()) {
+      if (now - entry.lastSeenAt > MESSAGE_HISTORY_STALE_MS) {
+        messageHistory.delete(scope);
+      }
+    }
+
+    if (messageHistory.size <= MESSAGE_HISTORY_MAX_SCOPES) return;
+
+    const sortedScopes = [...messageHistory.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt);
+    while (messageHistory.size > MESSAGE_HISTORY_MAX_SCOPES) {
+      const oldest = sortedScopes.shift();
+      if (!oldest) break;
+      messageHistory.delete(oldest[0]);
+    }
+  }
+
   function enqueueEvent(event: RawEvent): void {
     queueDbInsert(event);
+
+    messageHistoryCounter += 1;
+    if (messageHistoryCounter >= MESSAGE_HISTORY_CLEANUP_EVERY) {
+      messageHistoryCounter = 0;
+      cleanupMessageHistory();
+    }
   }
 
   function addMessage(scope: string, message: MessageCapture): void {
-    const list = messageHistory.get(scope) || [];
-    list.push(message);
-    if (list.length > MAX_HISTORY_PER_SCOPE) {
-      list.splice(0, list.length - MAX_HISTORY_PER_SCOPE);
+    const slot = messageHistory.get(scope) || { messages: [], lastSeenAt: Date.now() };
+    slot.messages.push(message);
+    if (slot.messages.length > MAX_HISTORY_PER_SCOPE) {
+      slot.messages.splice(0, slot.messages.length - MAX_HISTORY_PER_SCOPE);
     }
-    messageHistory.set(scope, list);
+    slot.lastSeenAt = Date.now();
+    messageHistory.set(scope, slot);
+
+    messageHistoryCounter += 1;
+    if (messageHistoryCounter >= MESSAGE_HISTORY_CLEANUP_EVERY) {
+      messageHistoryCounter = 0;
+      cleanupMessageHistory();
+    }
   }
 
   function getRecentMessages(scopeKeys: string[], windowSize: number): MessageCapture[] {
     const all: MessageCapture[] = [];
     for (const key of scopeKeys) {
-      const list = messageHistory.get(key) || [];
-      all.push(...list);
+      const entry = messageHistory.get(key);
+      if (entry) all.push(...entry.messages);
     }
     return all.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)).slice(-windowSize);
   }
@@ -1121,8 +1725,9 @@ export default function register(api: OpenClawPluginApi) {
 
         const normalized = normalizeSkillExecutionPath(rawPath);
         if (normalized) {
+          target.skillReadCount = (target.skillReadCount || 0) + 1;
           if (normalized === target.skillPath) {
-            if (target.toolReadCount > 1) target.sameSkillRetried = true;
+            if (target.skillReadCount > 1) target.sameSkillRetried = true;
           } else {
             target.fallbackSkillRetried = true;
           }
@@ -1223,6 +1828,7 @@ export default function register(api: OpenClawPluginApi) {
       intentContext,
       followupMessages: [],
       toolReadCount: 0,
+      skillReadCount: 0,
       encounteredSkillPaths: new Set(initialPath ? [initialPath] : []),
       sameSkillRetried: false,
       fallbackSkillRetried: false,
@@ -1294,6 +1900,115 @@ export default function register(api: OpenClawPluginApi) {
     }
 
     return { blocks, names, locations, count: names.length };
+  }
+
+  async function maybeNudgeSkills(event: RawEvent, ctx: RawContext): Promise<{ prependContext: string } | undefined> {
+    if (!routerEnabled) return;
+
+    const sessionKey = toStringLike(ctx?.sessionKey) || "";
+    const isSubagent = sessionKey.includes(":subagent:");
+    const isCron = toStringLike(ctx?.trigger) === "cron";
+
+    const shouldRoute =
+      (isSubagent && routerTargetSubagent) ||
+      (isCron && routerTargetCron);
+
+    if (!shouldRoute) return;
+
+    const prompt = toStringLike((event as RawEvent).prompt) || "";
+    const messageList = Array.isArray((event as RawEvent).messages) ? (event as RawEvent).messages : [];
+    const turnNumber = messageList.length ? messageIndexForTask(messageList, prompt) : null;
+
+    const taskText = prompt || messageList.map((m) => getTextFromMessage(m)).join("\n").trim();
+    if (!taskText) return;
+
+    const parsedBlocks = parseSkillBlock(prompt);
+    if (parsedBlocks.count > 0) return;
+
+    const configuredWorkspaceDir = toStringLike(ctx?.workspaceDir);
+    const workspaceDir = configuredWorkspaceDir && configuredWorkspaceDir.trim().length > 0 ? configuredWorkspaceDir : pluginWorkspaceDir;
+    const skillCache = await loadSkillCandidatesForWorkspace(workspaceDir);
+    const candidates = skillCache.candidates;
+    const { idf, avgDescLen } = skillCache;
+    if (!candidates.length) return;
+
+    const blocklist = new Set(routerBlocklist);
+
+    const candidateByName = new Map<string, SkillCandidate>();
+    for (const candidate of candidates) {
+      candidateByName.set(candidate.name.toLowerCase(), candidate);
+    }
+
+    const availableCandidates = candidates.filter((skill) => !blocklist.has(skill.name.toLowerCase()));
+    if (!availableCandidates.length) return;
+
+    const selected: SkillCandidate[] = [];
+    const seen = new Set<string>();
+    const hasOverride = [] as SkillCandidate[];
+
+    for (const override of routerOverrides) {
+      if (!override.matcher.test(taskText)) continue;
+
+      for (const skillName of override.skills || []) {
+        const skill = candidateByName.get(String(skillName).toLowerCase());
+        if (!skill) continue;
+        if (blocklist.has(skill.name.toLowerCase())) continue;
+        if (seen.has(skill.name.toLowerCase())) continue;
+        if (wasSkillHandledRecently(messageList, skill.name, skill.filePath, routerRecencyWindow)) continue;
+
+        hasOverride.push(skill);
+        seen.add(skill.name.toLowerCase());
+        if (hasOverride.length >= routerMaxSkillsToNudge) break;
+      }
+
+      if (hasOverride.length >= routerMaxSkillsToNudge) break;
+    }
+
+    if (hasOverride.length) {
+      selected.push(...hasOverride);
+    } else {
+      const scored = availableCandidates
+        .map((skill) => ({
+          skill,
+          ...scoreSkill(taskText, skill, routerSkillKeywords, idf, avgDescLen),
+        }))
+        .filter((row) => row.score >= routerMinScore)
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return a.skill.name.localeCompare(b.skill.name);
+        });
+
+      for (const row of scored) {
+        if (wasSkillHandledRecently(messageList, row.skill.name, row.skill.filePath, routerRecencyWindow)) continue;
+        const key = row.skill.name.toLowerCase();
+        if (seen.has(key)) continue;
+
+        selected.push(row.skill);
+        seen.add(key);
+        if (selected.length >= routerMaxSkillsToNudge) break;
+      }
+    }
+
+    if (!selected.length) return;
+
+    const taskExcerpt = sanitizeValue(scrubSecrets(taskText), 200);
+    for (const skill of selected) {
+      const isOverride = hasOverride.some((entry) => entry.name.toLowerCase() === skill.name.toLowerCase());
+      const row = isOverride ? { score: 0, reason: "override" } : scoreSkill(taskText, skill, routerSkillKeywords, idf, avgDescLen);
+
+      queueNudgeInsert({
+        event,
+        ctx,
+        skillName: skill.name,
+        skillPath: skill.filePath,
+        score: row.score,
+        matchReason: row.reason,
+        turnNumber,
+        taskExcerpt,
+      });
+    }
+
+    return { prependContext: formatNudge(selected) };
   }
 
 
@@ -1409,29 +2124,36 @@ export default function register(api: OpenClawPluginApi) {
   });
 
   api.on("before_prompt_build", async (event, ctx: RawContext) => {
-    if (!detectSkillBlocks) return;
-    const prompt = toStringLike((event as RawEvent).prompt);
-    if (!prompt) return;
+    const routerContext = await maybeNudgeSkills(event, ctx);
 
-    const info = parseSkillBlock(prompt);
-    if (!info.count) return;
+    if (detectSkillBlocks) {
+      const prompt = toStringLike((event as RawEvent).prompt);
+      if (prompt) {
+        const info = parseSkillBlock(prompt);
+        if (info.count) {
+          const timestamp = new Date().toISOString();
 
-    const timestamp = new Date().toISOString();
+          enqueueEvent({
+            v: 1,
+            ts: timestamp,
+            type: "skill_block_detected",
+            ...buildBase(undefined, ctx),
+            skillBlockCount: info.count,
+            skillBlockNames: info.names,
+            skillBlockLocations: info.locations,
+          });
 
-    enqueueEvent({
-      v: 1,
-      ts: timestamp,
-      type: "skill_block_detected",
-      ...buildBase(undefined, ctx),
-      skillBlockCount: info.count,
-      skillBlockNames: info.names,
-      skillBlockLocations: info.locations,
-    });
+          for (const block of info.blocks) {
+            const resolvedPath = resolveSkillPathFromBlock(block.name, block.location) || block.location || block.name;
+            if (!resolvedPath) continue;
+            startExecutionFromSkillRead(ctx, event as RawEvent, resolvedPath, timestamp, true);
+          }
+        }
+      }
+    }
 
-    for (const block of info.blocks) {
-      const resolvedPath = resolveSkillPathFromBlock(block.name, block.location) || block.location || block.name;
-      if (!resolvedPath) continue;
-      startExecutionFromSkillRead(ctx, event as RawEvent, resolvedPath, timestamp, true);
+    if (routerContext) {
+      return routerContext;
     }
   });
 

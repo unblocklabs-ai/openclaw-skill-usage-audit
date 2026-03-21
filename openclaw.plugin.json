@@ -2,7 +2,7 @@
   "id": "skill-usage-audit",
   "name": "Skill Usage Audit",
   "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "entry": "index.ts",
   "configSchema": {
     "type": "object",
@@ -60,6 +60,87 @@
         "description": "Max milliseconds to wait for follow-up messages before finalizing a skill execution record",
         "minimum": 0,
         "default": 60000
+      },
+      "router": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "targets": {
+            "type": "object",
+            "properties": {
+              "subagent": {
+                "type": "boolean",
+                "default": true
+              },
+              "cron": {
+                "type": "boolean",
+                "default": true
+              }
+            },
+            "default": {
+              "subagent": true,
+              "cron": true
+            }
+          },
+          "maxSkillsToNudge": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1
+          },
+          "minScore": {
+            "type": "number",
+            "default": 6
+          },
+          "recencyWindow": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 10,
+            "description": "Skip nudging a skill if it was nudged within this many messages"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "taskPattern": {
+                  "type": "string"
+                },
+                "skills": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": ["taskPattern", "skills"]
+            },
+            "default": []
+          },
+          "skillKeywords": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "default": {}
+          },
+          "blocklist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        },
+        "default": {
+          "enabled": true
+        }
       }
     }
   }
