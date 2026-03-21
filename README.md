@@ -1,24 +1,77 @@
-# skill-usage-audit
+# @unblocklabs/skill-usage-audit
 
-## What it does
+[![npm version](https://img.shields.io/npm/v/@unblocklabs/skill-usage-audit.svg)](https://www.npmjs.com/package/@unblocklabs/skill-usage-audit)
+[![license](https://img.shields.io/npm/l/@unblocklabs/skill-usage-audit.svg)](./package.json)
 
-`skill-usage-audit` is an OpenClaw plugin that records tool calls and skill execution telemetry to SQLite. It tracks:
+OpenClaw plugin that tracks skill/tool usage telemetry **and** automatically nudges sub-agents + cron runs toward relevant skills.
 
-- skill reads (which skill files were read)
-- tool call lifecycle (`before_tool_call`/`after_tool_call`)
-- user/assistant messages around a skill execution
-- inferred skill execution outcomes (`positive` / `negative` / `unclear`)
-- skill versions and execution snapshots
+---
 
-The goal is to give you machine-readable data for health scoring and automated lifecycle decisions (stable/experimental/degraded/underused).
+## Features
 
-## Install
+### Skill Router (new in v1.0.0)
+
+A lightweight routing layer that runs in `before_prompt_build` and **nudges** the model to read the most relevant skill(s).
+
+- **Targets:** sub-agent sessions and cron-triggered runs (configurable)
+- **Relevance scoring:** BM25-style scoring against skill *descriptions* (from `SKILL.md` frontmatter) + optional keyword boosts
+- **Lightweight injection:** adds ~100 tokens via `prependContext` (a “read this skill” hint) — **not** full skill injection
+- **Recency-aware dedup:** won’t re-nudge if the skill was recently suggested or already read (within a configurable message window)
+- **Suppresses when skill blocks exist:** if the prompt already contains `<skill ...>` blocks, router does nothing
+- **Manual overrides:** deterministic routing for critical workflows via `taskPattern → skills[]`
+- **Closed-loop tracking:** every nudge is recorded in SQLite (`skill_nudges`) so you can measure nudge → read → use conversion
+
+### Usage Audit (existing)
+
+A telemetry pipeline that records skill and tool execution behavior to SQLite.
+
+- Tracks:
+  - tool call lifecycle (`before_tool_call` / `after_tool_call`)
+  - skill file reads (infers skill name + source)
+  - session lifecycle (`session_start` / `session_end`)
+  - message context around skill execution (intent + follow-ups)
+- **Implied outcome detection:** `positive` / `negative` / `unclear` inferred from tool success + follow-up signals
+- **Skill version tracking:** content hashing of `SKILL.md` (+ optional `scripts/` folder) into `skill_versions`
+- **Privacy-first:** configurable message capture; secret/PII redaction (emails/phones/tokens/URL querystrings)
+
+---
+
+## Installation
+
+### npm (direct)
+
+```bash
+# In your OpenClaw extensions directory
+cd ~/.openclaw/extensions
+npm install @unblocklabs/skill-usage-audit
+```
+
+### OpenClaw CLI (equivalent)
 
 ```bash
 openclaw plugins install @unblocklabs/skill-usage-audit
 ```
 
-Then enable/configure in OpenClaw config:
+### Clone (dev)
+
+Clone into:
+
+```bash
+~/.openclaw/extensions/skill-usage-audit/
+```
+
+---
+
+## Requirements
+
+- **Node.js >= 22** (the plugin can use `node:sqlite` as a fallback)
+- Optional: `better-sqlite3` (if present, it will be preferred)
+
+---
+
+## Configuration
+
+In your `openclaw.json`:
 
 ```json
 {
@@ -27,7 +80,51 @@ Then enable/configure in OpenClaw config:
       "skill-usage-audit": {
         "enabled": true,
         "config": {
-          "dbPath": "~/.openclaw/audits/skill-usage.db"
+          "dbPath": "~/.openclaw/audits/skill-usage.db",
+          "includeToolParams": false,
+          "captureMessageContent": false,
+          "redactKeys": [
+            "token",
+            "apikey",
+            "api_key",
+            "apiKey",
+            "password",
+            "passwd",
+            "auth",
+            "authorization",
+            "secret",
+            "secretToken",
+            "refreshToken",
+            "client_secret"
+          ],
+          "skillBlockDetection": true,
+          "contextWindowSize": 5,
+          "contextTimeoutMs": 60000,
+          "router": {
+            "enabled": true,
+            "targets": {
+              "subagent": true,
+              "cron": true
+            },
+            "minScore": 6,
+            "maxSkillsToNudge": 1,
+            "recencyWindow": 10,
+            "overrides": [
+              {
+                "taskPattern": "(read|extract) (twitter|x)\\b",
+                "skills": ["browser-read-x"]
+              },
+              {
+                "taskPattern": "\\bspawn\\b|sub-agent",
+                "skills": ["sub-agents"]
+              }
+            ],
+            "skillKeywords": {
+              "video-understanding": ["loom", "tiktok", "vimeo", "youtube"],
+              "github": ["gh", "pull request", "ci", "workflow"]
+            },
+            "blocklist": ["humanizer"]
+          }
         }
       }
     }
@@ -35,104 +132,77 @@ Then enable/configure in OpenClaw config:
 }
 ```
 
-## Configuration (`configSchema`)
+Notes:
+- The router scores against **skill descriptions**. For best results, add YAML frontmatter to each `SKILL.md`:
+  ```md
+  ---
+  name: browser-read-x
+  description: Use when reading ANY X/Twitter URL — tweets, threads, articles, profiles.
+  ---
+  ```
+- Defaults (from `openclaw.plugin.json`): router enabled, `minScore=6`, `maxSkillsToNudge=1`, `recencyWindow=10`, targets `{subagent:true, cron:true}`.
 
-The plugin manifest defines these options:
+---
 
-- `dbPath` (string, default `~/.openclaw/audits/skill-usage.db`)
-  - SQLite database file to write telemetry to.
-- `includeToolParams` (boolean, default `false`)
-  - Include tool parameters in `before_tool_call` / `after_tool_call` event rows.
-- `captureMessageContent` (boolean, default `false`)
-  - If true, stores sanitized snapshots of message text; if false, stores only metadata for privacy.
-- `redactKeys` (array<string>, default `["token", "apikey", "api_key", "apiKey", "password", "passwd", "auth", "authorization", "secret", "secretToken", "refreshToken", "client_secret"]`)
-  - Keys that are redacted from object payloads before storage.
-- `skillBlockDetection` (boolean, default `true`)
-  - Emit `skill_block_detected` events from `before_prompt_build` prompts.
-- `contextWindowSize` (integer, default `5`, min `1`)
-  - Number of messages retained before/after a skill read for execution context.
-- `contextTimeoutMs` (integer, default `60000`, min `0`)
-  - Milliseconds to wait for follow-up messages before finalizing a skill execution record.
+## How the Router Works
 
-## What gets stored
+1. A **sub-agent** or **cron** session reaches `before_prompt_build`
+2. The plugin loads known skills (workspace `skills/`, `~/.openclaw/skills`, and bundled OpenClaw skills)
+3. It BM25-scores the task text against skill descriptions (plus optional keyword boosts)
+4. If the best score exceeds `router.minScore`, it injects a short hint via `prependContext`
+5. Nudges are logged to SQLite (`skill_nudges`) so you can evaluate effectiveness
 
-Data is written into SQLite tables from the plugin at `dbPath`:
+---
 
-- `skill_events`
-- `skill_versions`
-- `skills`
-- `skill_executions`
-- `skill_feedback`
-- `skill_health_snapshots`
+## Evaluator scripts
 
-## Query examples
+### `evaluate-skill-health.mjs`
 
-### Show recent skill executions
-
-```bash
-sqlite3 ~/.openclaw/audits/skill-usage.db \
-  "SELECT skill_name, ts, mechanical_success, implied_outcome, error FROM skill_executions ORDER BY ts DESC LIMIT 20;"
-```
-
-### Count by status recommendation
-
-```bash
-sqlite3 ~/.openclaw/audits/skill-usage.db \
-  "SELECT status, COUNT(*) FROM skills GROUP BY status;"
-```
-
-### Extract events and inspect JSON payloads with `jq`
-
-```bash
-sqlite3 -json ~/.openclaw/audits/skill-usage.db \
-  "SELECT ts, type, skill_name, params FROM skill_events WHERE type='tool_call_end' LIMIT 50;" \
-  | jq '.[].params'
-```
-
-### Show latest health snapshot per skill
-
-```bash
-sqlite3 ~/.openclaw/audits/skill-usage.db \
-  "SELECT skill_name, usage_count, mechanical_failure_rate, implied_negative_rate, status_recommendation, created_at FROM skill_health_snapshots ORDER BY created_at DESC LIMIT 20;"
-```
-
-## Evaluator script
-
-A bundled evaluator script can compute deterministic health signals and write recommendations back to the same DB:
+Computes per-skill health metrics from `skill_executions`, writes snapshots, updates `skills.status`, and emits a markdown report.
 
 ```bash
 node evaluate-skill-health.mjs --help
 node evaluate-skill-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --window-days 14
 ```
 
-Supported options (highlights):
-
+Useful flags:
 - `--db-path` / `--db` (or env `SKILL_USAGE_AUDIT_DB_PATH`)
 - `--report-dir <path>`
 - `--window-days <n>`
-- `--stable-min-usage <n>`
-- `--experimental-min-usage <n>`
-- `--degraded-sample-min <n>`
-- `--degraded-mechanical-rate <r>`
-- `--degraded-implied-rate <r>`
-- `--underused-max <n>`
 - `--no-update-status`
 - `--no-report`
-- `--no-filesystem-scan`
-- `--verbose`
 
-The evaluator writes:
+### `evaluate-nudge-health.mjs`
 
-- `skills.status` updates (stable/experimental/degraded/unused)
-- `skill_health_snapshots` rows for historical tracking
-- Markdown reports under `reports/skill-health/`
+Measures router effectiveness (nudge → skill read → downstream usage).
 
-## Requirements
+```bash
+node evaluate-nudge-health.mjs --help
+node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 14
+node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 14 --json
+```
 
-- **Node.js >= 22** (for `node:sqlite` support)
-- No external npm dependencies are required for the plugin at runtime.
+Flags:
+- `--days N` (default 14)
+- `--db-path <path>`
+- `--json`
 
-## Notes
+---
 
-- This package is distributed as a scoped npm package and installs into OpenClaw as `~/.openclaw/extensions/skill-usage-audit/`.
-- `openclaw.plugins install` uses `npm pack` under the hood and expects `index.ts` and `openclaw.plugin.json` to be included in package files.
+## Database schema (high level)
+
+The plugin writes to these SQLite tables:
+
+- `skill_events` — raw event stream (tool calls, session start/end, skill blocks)
+- `skill_executions` — aggregated “skill execution” records (intent context + follow-ups + implied outcome)
+- `skill_nudges` — router nudge events (score, match reason, task excerpt)
+- `skills` — per-skill rollups (status, last used, total executions, current version)
+- `skill_versions` — version hashes (content-based)
+- `skill_feedback` — optional feedback labels on executions
+- `skill_health_snapshots` — time series snapshots from the evaluator
+
+---
+
+## License
+
+MIT
