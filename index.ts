@@ -404,7 +404,7 @@ function makeMessageCapture(
 }
 
 function inferSkillName(skillPath: string): string {
-  const resolved = resolve(skillPath);
+  const resolved = skillPath.startsWith("~") ? resolveHomePath(skillPath) : resolve(skillPath);
   if (basename(resolved).toLowerCase() === "skill.md") {
     return basename(dirname(resolved));
   }
@@ -412,7 +412,7 @@ function inferSkillName(skillPath: string): string {
 }
 
 function inferSkillSource(skillPath: string): string {
-  const abs = resolve(skillPath);
+  const abs = skillPath.startsWith("~") ? resolveHomePath(skillPath) : resolve(skillPath);
   const home = resolve(process.env.HOME || process.env.USERPROFILE || "");
   if (abs.includes(`${home}/.openclaw/extensions`) || abs.includes(`${home}/.openclaw/extensions/`)) return "extension";
   if (abs.includes(`${home}/.openclaw/skills`) || abs.includes(`${home}/.openclaw/skills/`)) return "bundled";
@@ -1261,7 +1261,13 @@ async function computeSkillVersionHash(skillPath: string): Promise<string | null
   return hash.digest("hex");
 }
 
-export default function register(api: OpenClawPluginApi) {
+import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk";
+
+const plugin: OpenClawPluginDefinition = {
+  id: "skill-usage-audit",
+  name: "Skill Usage Audit",
+  description: "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
+  register(api: OpenClawPluginApi) {
   const log = api.logger;
   const cfg = (api.pluginConfig as PluginConfig) || {};
 
@@ -1382,7 +1388,7 @@ export default function register(api: OpenClawPluginApi) {
 
         state.statements.insertVersion({
           skill_name: skillName,
-          skill_path: resolve(skillPath),
+          skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
           version_hash: hash,
           first_seen_at: ts,
           notes: null,
@@ -1390,7 +1396,7 @@ export default function register(api: OpenClawPluginApi) {
 
         state.statements.upsertSkill({
           skill_name: skillName,
-          skill_path: resolve(skillPath),
+          skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
           current_version_hash: hash,
           status: "stable",
           last_modified_at: ts,
@@ -2057,7 +2063,7 @@ export default function register(api: OpenClawPluginApi) {
     const skillPath = extractSkillPathFromParams(params);
 
     if (toolName === "read" && skillPath) {
-      const normalized = resolve(skillPath);
+      const normalized = normalizeSkillExecutionPath(skillPath) || resolve(skillPath);
       const execution = startExecutionFromSkillRead(ctx, event as RawEvent, normalized, now);
       attachToolCall(scopeKeys, event as RawEvent, execution);
       return;
@@ -2203,43 +2209,17 @@ export default function register(api: OpenClawPluginApi) {
     return shutdownPromise;
   }
 
-  function handleSignal(signal: string): void {
-    const timeout = setTimeout(() => {
-      log.info(`skill-usage-audit: forced shutdown after ${signal}`);
-      if (dbState.backend) {
-        try {
-          dbState.backend.close();
-        } catch {
-          // ignore
-        }
-      }
-      process.exit(0);
-    }, 3500);
-
-    void requestFlush(`signal:${signal}`).finally(() => {
-      clearTimeout(timeout);
-      process.exit(0);
-    });
-  }
-
-  process.on("SIGTERM", () => handleSignal("SIGTERM"));
-  process.on("SIGINT", () => handleSignal("SIGINT"));
-  process.on("beforeExit", () => {
-    if (!shutdownInProgress) {
-      void requestFlush("beforeExit");
-    }
-  });
-  process.on("exit", () => {
-    if (dbState.backend) {
-      try {
-        dbState.backend.close();
-      } catch {
-        // ignore
-      }
-    }
+  // Use gateway_stop lifecycle hook instead of process signal handlers.
+  // Calling process.exit() from an in-process plugin can short-circuit
+  // the gateway's own shutdown ordering and destabilize other plugins.
+  api.on("gateway_stop", async () => {
+    await requestFlush("gateway_stop");
   });
 
   // eager init for logs
   void ensureDbReady();
   log.info("skill-usage-audit plugin registered");
-}
+  },
+};
+
+export default plugin;

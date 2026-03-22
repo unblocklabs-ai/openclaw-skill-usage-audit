@@ -2,8 +2,7 @@
   "id": "skill-usage-audit",
   "name": "Skill Usage Audit",
   "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
-  "version": "1.0.0",
-  "entry": "index.ts",
+  "version": "1.0.1",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
