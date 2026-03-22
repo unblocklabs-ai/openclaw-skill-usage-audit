@@ -385,7 +385,6 @@ function makeMessageCapture(
 ): MessageCapture | null {
   if (typeof text !== "string") return null;
 
-  const safeText = normalizeText(text, redactKeys);
   const snap: MessageCapture = {
     ts: new Date().toISOString(),
     role,
@@ -394,6 +393,7 @@ function makeMessageCapture(
   };
 
   if (captureContent) {
+    const safeText = normalizeText(text, redactKeys);
     snap.text = safeText;
     if (metadata !== undefined) {
       snap.metadata = normalizeText(metadata, redactKeys);
@@ -612,6 +612,8 @@ function extractReadPathsFromToolMessage(message: unknown): string[] {
 
   if (params) {
     collect(params.path);
+    collect(params.file_path);
+    collect(params.filePath);
   }
 
   return out;
@@ -798,8 +800,9 @@ function buildIdfTable(candidates: SkillCandidate[]): { idf: Map<string, number>
   let totalDescLen = 0;
 
   for (const candidate of candidates) {
-    const tokens = new Set(tokenize(candidate.description));
-    totalDescLen += tokens.size;
+    const descTokens = tokenize(candidate.description);
+    totalDescLen += descTokens.length;
+    const tokens = new Set(descTokens);
     for (const token of tokens) {
       docFreq.set(token, (docFreq.get(token) || 0) + 1);
     }
@@ -1303,6 +1306,9 @@ const plugin: OpenClawPluginDefinition = {
   const dbInitPromise = initSqlite(dbPath, log);
   let dbChain = Promise.resolve<void>(undefined);
   let hasLoggedDbIssue = false;
+  const DB_QUEUE_DROP_THRESHOLD = 500;
+  let dbQueueDepth = 0;
+  let hasLoggedDbQueueDrop = false;
 
   let shutdownInProgress = false;
   let shutdownPromise: Promise<void> | null = null;
@@ -1335,77 +1341,102 @@ const plugin: OpenClawPluginDefinition = {
     return dbState;
   }
 
+  function scheduleDbWrite(label: string, critical: boolean, write: () => Promise<void> | void): void {
+    if (shutdownInProgress) return;
+
+    if (!critical && dbQueueDepth >= DB_QUEUE_DROP_THRESHOLD) {
+      if (!hasLoggedDbQueueDrop) {
+        hasLoggedDbQueueDrop = true;
+        log.info(`skill-usage-audit: db queue backlog high (${dbQueueDepth}); dropping non-critical inserts`);
+      }
+      return;
+    }
+
+    dbQueueDepth += 1;
+    dbChain = dbChain
+      .then(async () => write())
+      .catch((err) => {
+        log.error(`skill-usage-audit: ${label}: ${String(err)}`);
+      })
+      .finally(() => {
+        dbQueueDepth = Math.max(0, dbQueueDepth - 1);
+        if (dbQueueDepth < DB_QUEUE_DROP_THRESHOLD) {
+          hasLoggedDbQueueDrop = false;
+        }
+      });
+  }
+
   function queueDbInsert(rowType: RawEvent): void {
+    if (shutdownInProgress) return;
     if (rowType.type !== "session_start" && rowType.type !== "session_end" && rowType.type !== "tool_call_start" && rowType.type !== "tool_call_end" && rowType.type !== "skill_file_read" && rowType.type !== "skill_block_detected") {
       return;
     }
 
-    dbChain = dbChain
-      .then(async () => {
-        const state = await ensureDbReady();
-        if (!state.statements) return;
+    scheduleDbWrite("event insert failed", false, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
 
-        const row = {
-          ts: toStringLike(rowType.ts) || new Date().toISOString(),
-          type: rowType.type,
-          session_id: toStringLike(rowType.sessionId) || null,
-          session_key: toStringLike(rowType.sessionKey) || null,
-          run_id: toStringLike(rowType.runId) || null,
-          agent_id: toStringLike(rowType.agentId) || null,
-          channel_id: toStringLike(rowType.channelId) || null,
-          message_provider: toStringLike(rowType.messageProvider) || null,
-          tool_name: toStringLike(rowType.toolName) || null,
-          tool_call_id: toStringLike(rowType.toolCallId) || null,
-          params: rowType.params ? JSON.stringify(rowType.params) : null,
-          duration_ms: typeof rowType.durationMs === "number" ? Math.max(0, Math.floor(rowType.durationMs)) : null,
-          success: typeof rowType.success === "boolean" ? (rowType.success ? 1 : 0) : null,
-          error: toStringLike(rowType.error) || null,
-          skill_name: toStringLike(rowType.skillName) || null,
-          skill_path: toStringLike(rowType.skillPath) || null,
-          skill_source: toStringLike(rowType.skillSource) || null,
-          skill_block_count: typeof rowType.skillBlockCount === "number" && Number.isFinite(rowType.skillBlockCount)
-            ? Math.max(0, Math.floor(rowType.skillBlockCount))
-            : null,
-          skill_block_names: Array.isArray(rowType.skillBlockNames) ? JSON.stringify(rowType.skillBlockNames) : null,
-          skill_block_locations: Array.isArray(rowType.skillBlockLocations) ? JSON.stringify(rowType.skillBlockLocations) : null,
-        };
+      const row = {
+        ts: toStringLike(rowType.ts) || new Date().toISOString(),
+        type: rowType.type,
+        session_id: toStringLike(rowType.sessionId) || null,
+        session_key: toStringLike(rowType.sessionKey) || null,
+        run_id: toStringLike(rowType.runId) || null,
+        agent_id: toStringLike(rowType.agentId) || null,
+        channel_id: toStringLike(rowType.channelId) || null,
+        message_provider: toStringLike(rowType.messageProvider) || null,
+        tool_name: toStringLike(rowType.toolName) || null,
+        tool_call_id: toStringLike(rowType.toolCallId) || null,
+        params: rowType.params ? JSON.stringify(rowType.params) : null,
+        duration_ms: typeof rowType.durationMs === "number" ? Math.max(0, Math.floor(rowType.durationMs)) : null,
+        success:
+          typeof rowType.success === "boolean"
+            ? (rowType.success ? 1 : 0)
+            : typeof rowType.success === "number" && Number.isFinite(rowType.success)
+              ? (rowType.success ? 1 : 0)
+              : null,
+        error: toStringLike(rowType.error) || null,
+        skill_name: toStringLike(rowType.skillName) || null,
+        skill_path: toStringLike(rowType.skillPath) || null,
+        skill_source: toStringLike(rowType.skillSource) || null,
+        skill_block_count: typeof rowType.skillBlockCount === "number" && Number.isFinite(rowType.skillBlockCount)
+          ? Math.max(0, Math.floor(rowType.skillBlockCount))
+          : null,
+        skill_block_names: Array.isArray(rowType.skillBlockNames) ? JSON.stringify(rowType.skillBlockNames) : null,
+        skill_block_locations: Array.isArray(rowType.skillBlockLocations) ? JSON.stringify(rowType.skillBlockLocations) : null,
+      };
 
-        state.statements?.insertEvent(row);
-      })
-      .catch((err) => {
-        log.error(`skill-usage-audit: db write failed: ${String(err)}`);
-      });
+      state.statements?.insertEvent(row);
+    });
   }
 
   function queueSkillVersionWrite(skillName: string, skillPath: string, ts: string, versionHash: string | null | undefined): void {
-    dbChain = dbChain
-      .then(async () => {
-        const state = await ensureDbReady();
-        if (!state.statements) return;
+    if (shutdownInProgress) return;
 
-        const hash = versionHash ?? (await computeSkillVersionHash(skillPath));
-        if (!hash) return;
+    scheduleDbWrite("failed writing skill version", true, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
 
-        state.statements.insertVersion({
-          skill_name: skillName,
-          skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
-          version_hash: hash,
-          first_seen_at: ts,
-          notes: null,
-        });
+      const hash = versionHash ?? (await computeSkillVersionHash(skillPath));
+      if (!hash) return;
 
-        state.statements.upsertSkill({
-          skill_name: skillName,
-          skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
-          current_version_hash: hash,
-          status: "stable",
-          last_modified_at: ts,
-          last_used_at: ts,
-        });
-      })
-      .catch((err) => {
-        log.error(`skill-usage-audit: failed writing skill version: ${String(err)}`);
+      state.statements.insertVersion({
+        skill_name: skillName,
+        skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
+        version_hash: hash,
+        first_seen_at: ts,
+        notes: null,
       });
+
+      state.statements.upsertSkill({
+        skill_name: skillName,
+        skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
+        current_version_hash: hash,
+        status: "stable",
+        last_modified_at: ts,
+        last_used_at: ts,
+      });
+    });
   }
 
   function queueNudgeInsert(params: {
@@ -1418,27 +1449,25 @@ const plugin: OpenClawPluginDefinition = {
     turnNumber: number | null;
     taskExcerpt: string;
   }): void {
-    dbChain = dbChain
-      .then(async () => {
-        const state = await ensureDbReady();
-        if (!state.statements) return;
+    if (shutdownInProgress) return;
 
-        const base = buildBase(params.event as { sessionId?: string; runId?: string }, params.ctx);
-        state.statements.insertNudge({
-          session_key: base.sessionKey || null,
-          session_id: base.sessionId || null,
-          agent_id: base.agentId || null,
-          skill_name: params.skillName,
-          skill_path: params.skillPath || null,
-          score: params.score,
-          match_reason: params.matchReason,
-          turn_number: params.turnNumber,
-          task_excerpt: params.taskExcerpt,
-        });
-      })
-      .catch((err) => {
-        log.error(`skill-usage-audit: failed writing nudge: ${String(err)}`);
+    scheduleDbWrite("failed writing nudge", true, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
+
+      const base = buildBase(params.event as { sessionId?: string; runId?: string }, params.ctx);
+      state.statements.insertNudge({
+        session_key: base.sessionKey || null,
+        session_id: base.sessionId || null,
+        agent_id: base.agentId || null,
+        skill_name: params.skillName,
+        skill_path: params.skillPath || null,
+        score: params.score,
+        match_reason: params.matchReason,
+        turn_number: params.turnNumber,
+        task_excerpt: params.taskExcerpt,
       });
+    });
   }
 
   function cleanupMessageHistory(): void {
@@ -1548,7 +1577,6 @@ const plugin: OpenClawPluginDefinition = {
     execution.followupStartedAt = Date.now();
 
     if (contextTimeoutMs <= 0) {
-      finalizeExecution(execution.id, "followup-timeout");
       return;
     }
 
@@ -1591,48 +1619,44 @@ const plugin: OpenClawPluginDefinition = {
     const durationMs = Math.max(0, Date.now() - execution.startAt);
     const outcome = determineOutcome(execution);
 
-    dbChain = dbChain
-      .then(async () => {
-        const state = await ensureDbReady();
-        if (!state.statements) return;
+    scheduleDbWrite(`failed inserting execution ${executionId} (${reason})`, true, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
 
-        let versionHash = execution.versionHash ?? null;
-        if (!versionHash && execution.versionHashPromise) {
-          try {
-            versionHash = await execution.versionHashPromise;
-          } catch {
-            versionHash = null;
-          }
+      let versionHash = execution.versionHash ?? null;
+      if (!versionHash && execution.versionHashPromise) {
+        try {
+          versionHash = await execution.versionHashPromise;
+        } catch {
+          versionHash = null;
         }
+      }
 
-        if (!versionHash) {
-          const row = state.statements.getLatestSkillVersion({
-            skill_name: execution.skillName,
-            skill_path: execution.skillPath,
-          });
-          if (row?.version_hash) versionHash = String(row.version_hash);
-        }
-
-        const mechanicalSuccess = execution.hadToolCall ? (execution.mechanicalSuccess ? 1 : 0) : null;
-        state.statements.insertExecution({
-          ts: execution.ts,
-          session_key: execution.sessionKey || null,
-          run_id: execution.runId || null,
+      if (!versionHash) {
+        const row = state.statements.getLatestSkillVersion({
           skill_name: execution.skillName,
           skill_path: execution.skillPath,
-          version_hash: versionHash || null,
-          intent_context: JSON.stringify(execution.intentContext),
-          mechanical_success: mechanicalSuccess,
-          semantic_outcome: "unclear",
-          followup_messages: JSON.stringify(execution.followupMessages),
-          implied_outcome: outcome,
-          error: execution.error || null,
-          duration_ms: durationMs,
         });
-      })
-      .catch((err) => {
-        log.error(`skill-usage-audit: failed inserting execution ${executionId}: ${String(err)} (${reason})`);
+        if (row?.version_hash) versionHash = String(row.version_hash);
+      }
+
+      const mechanicalSuccess = execution.hadToolCall ? (execution.mechanicalSuccess ? 1 : 0) : null;
+      state.statements.insertExecution({
+        ts: execution.ts,
+        session_key: execution.sessionKey || null,
+        run_id: execution.runId || null,
+        skill_name: execution.skillName,
+        skill_path: execution.skillPath,
+        version_hash: versionHash || null,
+        intent_context: JSON.stringify(execution.intentContext),
+        mechanical_success: mechanicalSuccess,
+        semantic_outcome: "unclear",
+        followup_messages: JSON.stringify(execution.followupMessages),
+        implied_outcome: outcome,
+        error: execution.error || null,
+        duration_ms: durationMs,
       });
+    });
   }
 
   function normalizeSkillExecutionPath(rawPath: string | undefined): string | undefined {
@@ -1711,7 +1735,17 @@ const plugin: OpenClawPluginDefinition = {
 
     if (target.inFollowup) stopFollowup(target);
 
-    target.hadToolCall = true;
+    const toolName = toStringLike(event.toolName) || "";
+    const params =
+      typeof event.params === "object" && event.params !== null
+        ? event.params as Record<string, unknown>
+        : undefined;
+    const isSkillRead = toolName === "read" && extractSkillPathFromParams(params || {}) !== undefined;
+
+    if (!isSkillRead) {
+      target.hadToolCall = true;
+    }
+
     target.toolReadCount += 1;
 
     const callId = toStringLike(event.toolCallId)
@@ -1721,10 +1755,8 @@ const plugin: OpenClawPluginDefinition = {
 
     execByTool.set(callId, target.id);
 
-    const toolName = toStringLike(event.toolName) || "";
-    if (toolName === "read" && typeof event.params === "object") {
-      const p = event.params as Record<string, unknown>;
-      const rawPath = extractSkillPathFromParams(p);
+    if (toolName === "read" && params) {
+      const rawPath = extractSkillPathFromParams(params);
       if (rawPath) {
         const inferredSkillName = inferSkillName(rawPath);
         syncExecutionPath(target, inferredSkillName, rawPath);
@@ -1794,9 +1826,6 @@ const plugin: OpenClawPluginDefinition = {
       return;
     }
 
-    if (contextTimeoutMs <= 0 && execution.followupMessages.length > 0) {
-      finalizeExecution(execution.id, "no-timeout");
-    }
   }
 
   function startExecutionFromSkillRead(
@@ -2088,7 +2117,7 @@ const plugin: OpenClawPluginDefinition = {
       toolCallId: toStringLike((event as RawEvent).toolCallId),
       params: includeToolParams ? buildToolParams(toolName, params, redactKeys) : undefined,
       durationMs: typeof (event as RawEvent).durationMs === "number" ? Number((event as RawEvent).durationMs) : undefined,
-      success: !(typeof (event as RawEvent).error === "string"),
+      success: (event as RawEvent).error ? 0 : 1,
       error: toStringLike((event as RawEvent).error),
       skillName: linked?.skillName,
       skillPath: linked?.skillPath,
