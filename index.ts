@@ -525,7 +525,17 @@ function buildMessageScope(ctx: RawContext | undefined, event: RawEvent | undefi
 
 const workspaceSkillCache = new Map<string, SkillCandidateCache>();
 
-function resolveWorkspaceDir(): string {
+function resolveWorkspaceDir(config?: { agents?: Record<string, { workspace?: string }> }): string {
+  // 1. Try reading workspace from config (most reliable)
+  if (config?.agents) {
+    // Check agent-specific workspace first (main), then defaults
+    const mainWorkspace = config.agents.main?.workspace;
+    if (mainWorkspace && mainWorkspace.trim()) return resolveHomePath(mainWorkspace);
+    const defaultWorkspace = config.agents.defaults?.workspace;
+    if (defaultWorkspace && defaultWorkspace.trim()) return resolveHomePath(defaultWorkspace);
+  }
+
+  // 2. Fallback: derive from __dirname (works when plugin is inside workspace/.openclaw/extensions/)
   const extDir = resolve(__dirname);
   const marker = `${sep}.openclaw${sep}`;
   const markerIdx = extDir.indexOf(marker);
@@ -1366,7 +1376,7 @@ export default definePluginEntry({
     }).filter((entry): entry is RouterOverride & { matcher: RegExp } => Boolean(entry));
     const routerSkillKeywords = parseSkillKeywords(routerConfig.skillKeywords);
     const routerBlocklist = new Set(parseBlocklist(routerConfig.blocklist));
-    const pluginWorkspaceDir = resolveWorkspaceDir();
+    const pluginWorkspaceDir = resolveWorkspaceDir(api.config as { agents?: Record<string, { workspace?: string }> });
 
     const messageHistory = new Map<string, MessageHistoryEntry>();
     let messageHistoryCounter = 0;
