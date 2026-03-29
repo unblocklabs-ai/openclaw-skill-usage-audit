@@ -7,7 +7,7 @@ import { dirname, basename, resolve, join, relative, sep } from "node:path";
 
 import { createHash } from "node:crypto";
 
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 
 const DEFAULT_DB_PATH = "~/.openclaw/audits/skill-usage.db";
@@ -58,22 +58,25 @@ const URL_WITH_QUERY_PATTERN = /https?:\/\/[^\s<>"']+\?[^\s<>"']*/gi;
 const NEGATIVE_MESSAGE_PATTERNS = [
   /wrong/i,
   /try again/i,
-  /that didn['’]?t work/i,
-  /no that['’]?s not/i,
+  /that didn['']?t work/i,
+  /no that['']?s not/i,
   /\bredo\b/i,
+  /\bincorrect\b/i,
+  /did not/i,
+];
+
+// Patterns that only match when message role === "user" (too noisy on assistant messages)
+const USER_ONLY_NEGATIVE_PATTERNS = [
   /\bfix\b/i,
   /\bbroken\b/i,
   /\bbad\b/i,
-  /\bincorrect\b/i,
-  /sorry/i,
-  /apolog/i,
-  /did not/i,
 ];
 
 interface PluginConfig {
   dbPath?: string;
   captureMessageContent?: unknown;
   includeToolParams?: boolean;
+  scrubPII?: boolean;
   redactKeys?: unknown;
   skillBlockDetection?: boolean;
   contextWindowSize?: unknown;
@@ -166,8 +169,8 @@ interface SkillExecutionState {
   intentContext: MessageCapture[];
   followupMessages: MessageCapture[];
 
-  toolReadCount: number;
-  skillReadCount: number;
+  attachedToolCallCount: number;
+  skillFileReadCount: number;
   encounteredSkillPaths: Set<string>;
   sameSkillRetried: boolean;
   fallbackSkillRetried: boolean;
@@ -276,27 +279,27 @@ function parseBooleanConfig(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function normalizeText(value: unknown, redactKeys: Set<string>): string {
+function normalizeText(value: unknown, redactKeys: Set<string>, piiEnabled = true): string {
   const text = typeof value !== "string" ? String(value ?? "") : value;
-  return sanitizeValue(redactParams(text, redactKeys), MAX_MESSAGE_LEN);
+  return sanitizeValue(redactParams(text, redactKeys, piiEnabled), MAX_MESSAGE_LEN, piiEnabled);
 }
 
-function sanitizeValue(value: unknown, maxLen = 400): string {
+function sanitizeValue(value: unknown, maxLen = 400, piiEnabled = true): string {
   if (value === null || value === undefined) return "";
 
   if (typeof value === "string") {
-    const scrubbed = scrubSecrets(value);
+    const scrubbed = scrubSecrets(value, piiEnabled);
     return scrubbed.length <= maxLen
       ? scrubbed
       : `${scrubbed.slice(0, maxLen)}…[truncated ${scrubbed.length - maxLen} chars]`;
   }
 
   if (Array.isArray(value)) {
-    return JSON.stringify(value.map((entry) => sanitizeValue(entry, maxLen))).slice(0, maxLen);
+    return JSON.stringify(value.map((entry) => sanitizeValue(entry, maxLen, piiEnabled))).slice(0, maxLen);
   }
 
   if (typeof value === "object") {
-    return JSON.stringify(redactParams(value, new Set())).slice(0, maxLen);
+    return JSON.stringify(redactParams(value, new Set(), piiEnabled)).slice(0, maxLen);
   }
 
   return String(value).slice(0, maxLen);
@@ -310,11 +313,19 @@ function redactUrlsWithQuery(value: string): string {
   });
 }
 
-function scrubSecrets(value: string): string {
+function scrubTokensOnly(value: string): string {
+  return SECRET_PATTERNS.reduce((next, pattern) => next.replace(pattern, "[REDACTED]"), value);
+}
+
+function scrubPIIFromValue(value: string): string {
   const cleaned = sanitizePII(EMAIL_PATTERN, value);
   const scrubbedQuery = redactUrlsWithQuery(cleaned);
-  const scrubbedPhone = sanitizePII(PHONE_PATTERN, scrubbedQuery);
-  return SECRET_PATTERNS.reduce((next, pattern) => next.replace(pattern, "[REDACTED]"), scrubbedPhone);
+  return sanitizePII(PHONE_PATTERN, scrubbedQuery);
+}
+
+function scrubSecrets(value: string, piiEnabled = true): string {
+  const tokenScrubbed = scrubTokensOnly(value);
+  return piiEnabled ? scrubPIIFromValue(tokenScrubbed) : tokenScrubbed;
 }
 
 function sanitizePII(pattern: RegExp, value: string): string {
@@ -326,24 +337,24 @@ function shouldRedactKey(key: string, redactKeys: Set<string>): boolean {
   return candidate.includes("token") || candidate.includes("secret") || candidate.includes("auth") || candidate.includes("password");
 }
 
-function redactParams(value: unknown, redactKeys: Set<string>): unknown {
+function redactParams(value: unknown, redactKeys: Set<string>, piiEnabled = true): unknown {
   if (value === null || value === undefined) return value;
 
-  if (typeof value === "string") return scrubSecrets(value);
-  if (Array.isArray(value)) return value.map((entry) => redactParams(entry, redactKeys));
+  if (typeof value === "string") return scrubSecrets(value, piiEnabled);
+  if (Array.isArray(value)) return value.map((entry) => redactParams(entry, redactKeys, piiEnabled));
   if (typeof value !== "object") return value;
 
   const entries = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entries)) {
-    out[k] = shouldRedactKey(k, redactKeys) ? "[REDACTED]" : redactParams(v, redactKeys);
+    out[k] = shouldRedactKey(k, redactKeys) ? "[REDACTED]" : redactParams(v, redactKeys, piiEnabled);
   }
   return out;
 }
 
-function buildToolParams(toolName: string, params: Record<string, unknown>, redactKeys: Set<string>) {
+function buildToolParams(toolName: string, params: Record<string, unknown>, redactKeys: Set<string>, piiEnabled = true) {
   if (toolName === "write" || toolName === "message") {
-    const scrubbed = redactParams(params, redactKeys);
+    const scrubbed = redactParams(params, redactKeys, piiEnabled);
     if (typeof scrubbed === "object" && scrubbed && !Array.isArray(scrubbed)) {
       const copy = { ...(scrubbed as Record<string, unknown>) };
       if (Object.prototype.hasOwnProperty.call(copy, "text")) copy.text = "[REDACTED]";
@@ -361,14 +372,18 @@ function buildToolParams(toolName: string, params: Record<string, unknown>, reda
     return copy;
   }
 
-  return redactParams(params, redactKeys);
+  return redactParams(params, redactKeys, piiEnabled);
 }
 
-function detectMessageSignals(execution: SkillExecutionState | undefined, text: string): string[] {
+function detectMessageSignals(execution: SkillExecutionState | undefined, text: string, role?: string): string[] {
   const lower = text.toLowerCase();
   const labels = new Set<string>();
 
   if (NEGATIVE_MESSAGE_PATTERNS.some((pattern) => pattern.test(lower))) {
+    labels.add("negative_phrase_detected");
+  }
+
+  if (role === "user" && USER_ONLY_NEGATIVE_PATTERNS.some((pattern) => pattern.test(lower))) {
     labels.add("negative_phrase_detected");
   }
 
@@ -402,6 +417,7 @@ function makeMessageCapture(
   redactKeys: Set<string>,
   captureContent: boolean,
   signalLabels: string[] = [],
+  piiEnabled = true,
 ): MessageCapture | null {
   if (typeof text !== "string") return null;
 
@@ -413,10 +429,10 @@ function makeMessageCapture(
   };
 
   if (captureContent) {
-    const safeText = normalizeText(text, redactKeys);
+    const safeText = normalizeText(text, redactKeys, piiEnabled);
     snap.text = safeText;
     if (metadata !== undefined) {
-      snap.metadata = normalizeText(metadata, redactKeys);
+      snap.metadata = normalizeText(metadata, redactKeys, piiEnabled);
     }
   }
 
@@ -737,7 +753,8 @@ async function collectSkillCandidatesFromRoot(root: string): Promise<SkillCandid
     try {
       const raw = await readFile(skillPath, "utf8");
       frontmatter = parseFrontmatterFromSkillMd(raw);
-    } catch {
+    } catch (err) {
+      log.debug?.(`skill-usage-audit: readFile SKILL.md failed for ${skillPath}: ${String(err)}`);
       continue;
     }
 
@@ -850,7 +867,7 @@ function scoreSkill(
   let score = 0;
   let reason = "";
 
-  // Name match bonus (still valuable — distinctive signal)
+  // Name match bonus (still valuable - distinctive signal)
   if (taskText.toLowerCase().includes(skill.name.toLowerCase())) {
     score += 10;
     reason = "name_match";
@@ -884,7 +901,7 @@ function scoreSkill(
   score += bm25;
   if (bm25 > 0 && !reason) reason = "bm25";
 
-  // Config keyword hits (+5 per keyword — manual boost for known associations)
+  // Config keyword hits (+5 per keyword - manual boost for known associations)
   const skillKeywords = keywords[skill.name.toLowerCase()] || [];
   for (const kw of skillKeywords) {
     if (taskText.toLowerCase().includes(kw.toLowerCase())) {
@@ -1039,8 +1056,8 @@ function createPreparedStatements(db: SqliteBackend): DbPrepared {
     insertEvent: (params) => {
       try {
         insertEvent.run(params);
-      } catch {
-        // ignore duplicate event shape issues; keep write path non-blocking
+      } catch (err) {
+        log.debug?.(`skill-usage-audit: insertEvent failed: ${String(err)}`);
       }
     },
     insertVersion: (params) => {
@@ -1049,15 +1066,15 @@ function createPreparedStatements(db: SqliteBackend): DbPrepared {
         if (!existing?.version_hash) {
           insertVersion.run(params);
         }
-      } catch {
-        // best effort
+      } catch (err) {
+        log.debug?.(`skill-usage-audit: insertVersion failed: ${String(err)}`);
       }
     },
     upsertSkill: (params) => {
       try {
         upsertSkill.run(params);
-      } catch {
-        // best effort
+      } catch (err) {
+        log.debug?.(`skill-usage-audit: upsertSkill failed: ${String(err)}`);
       }
     },
     getLatestSkillVersion: (params) => getLatestSkillVersion.get(params) as { version_hash?: string } | undefined,
@@ -1066,8 +1083,8 @@ function createPreparedStatements(db: SqliteBackend): DbPrepared {
     insertNudge: (params) => {
       try {
         insertNudge.run(params);
-      } catch {
-        // best effort
+      } catch (err) {
+        log.debug?.(`skill-usage-audit: insertNudge failed: ${String(err)}`);
       }
     },
   };
@@ -1284,13 +1301,11 @@ async function computeSkillVersionHash(skillPath: string): Promise<string | null
   return hash.digest("hex");
 }
 
-import type { OpenClawPluginDefinition } from "openclaw/plugin-sdk";
-
-const plugin: OpenClawPluginDefinition = {
+export default definePluginEntry({
   id: "skill-usage-audit",
   name: "Skill Usage Audit",
-  description: "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
-  register(api: OpenClawPluginApi) {
+  description: "Skill usage telemetry, execution tracking, and intelligent skill routing for OpenClaw. Writes audit data to SQLite.",
+  register(api) {
     const log = api.logger;
     const registrationMode = api.registrationMode || "full";
     const sharedState = skillUsageAuditGlobalAccessor.__skillUsageAuditState!;
@@ -1311,6 +1326,7 @@ const plugin: OpenClawPluginDefinition = {
 
     const includeToolParams = cfg.includeToolParams ?? DEFAULT_INCLUDE_TOOL_PARAMS;
     const captureMessageContent = cfg.captureMessageContent === undefined ? DEFAULT_CAPTURE_MESSAGE_CONTENT : cfg.captureMessageContent === true;
+    const piiEnabled = cfg.scrubPII !== false; // default true
     const redactKeys = new Set((Array.isArray(cfg.redactKeys) ? cfg.redactKeys : DEFAULT_REDACT_KEYS).map((k) => String(k).toLowerCase()));
     const contextWindowSize = parseIntConfig(cfg.contextWindowSize, DEFAULT_CONTEXT_WINDOW_SIZE, 1);
     const contextTimeoutMs = parseIntConfig(cfg.contextTimeoutMs, DEFAULT_CONTEXT_TIMEOUT_MS, 0);
@@ -1359,6 +1375,10 @@ const plugin: OpenClawPluginDefinition = {
     const execByScope = new Map<string, SkillExecutionState[]>();
     const execByTool = new Map<string, number>();
     let executionSeq = 0;
+
+    const EXECUTION_STALE_MS = 10 * 60 * 1000; // 10 minutes
+    const EXECUTION_CLEANUP_EVERY = 50;
+    let executionCleanupCounter = 0;
 
     async function ensureDbReady(): Promise<DbState> {
     if (dbState.backend || dbState.statements || dbState.error) {
@@ -1536,6 +1556,16 @@ const plugin: OpenClawPluginDefinition = {
     }
   }
 
+  function cleanupStaleExecutions(): void {
+    const now = Date.now();
+    for (const [id, execution] of executionsById.entries()) {
+      if (execution.finalized) continue;
+      if (now - execution.startAt > EXECUTION_STALE_MS && execution.inFlightToolCalls.size === 0) {
+        finalizeExecution(id, "stale-cleanup");
+      }
+    }
+  }
+
   function enqueueEvent(event: RawEvent): void {
     queueDbInsert(event);
 
@@ -1543,6 +1573,12 @@ const plugin: OpenClawPluginDefinition = {
     if (messageHistoryCounter >= MESSAGE_HISTORY_CLEANUP_EVERY) {
       messageHistoryCounter = 0;
       cleanupMessageHistory();
+    }
+
+    executionCleanupCounter += 1;
+    if (executionCleanupCounter >= EXECUTION_CLEANUP_EVERY) {
+      executionCleanupCounter = 0;
+      cleanupStaleExecutions();
     }
   }
 
@@ -1793,11 +1829,11 @@ const plugin: OpenClawPluginDefinition = {
       target.hadToolCall = true;
     }
 
-    target.toolReadCount += 1;
+    target.attachedToolCallCount += 1;
 
     const callId = toStringLike(event.toolCallId)
       ? `tool:${toStringLike(event.toolCallId)}`
-      : `anon:${target.id}:${target.toolReadCount}`;
+      : `anon:${target.id}:${target.attachedToolCallCount}`;
     target.inFlightToolCalls.add(callId);
 
     execByTool.set(callId, target.id);
@@ -1810,9 +1846,9 @@ const plugin: OpenClawPluginDefinition = {
 
         const normalized = normalizeSkillExecutionPath(rawPath);
         if (normalized) {
-          target.skillReadCount = (target.skillReadCount || 0) + 1;
+          target.skillFileReadCount = (target.skillFileReadCount || 0) + 1;
           if (normalized === target.skillPath) {
-            if (target.skillReadCount > 1) target.sameSkillRetried = true;
+            if (target.skillFileReadCount > 1) target.sameSkillRetried = true;
           } else {
             target.fallbackSkillRetried = true;
           }
@@ -1909,8 +1945,8 @@ const plugin: OpenClawPluginDefinition = {
       versionHashPromise: computeSkillVersionHash(initialPath),
       intentContext,
       followupMessages: [],
-      toolReadCount: 0,
-      skillReadCount: 0,
+      attachedToolCallCount: 0,
+      skillFileReadCount: 0,
       encounteredSkillPaths: new Set(initialPath ? [initialPath] : []),
       sameSkillRetried: false,
       fallbackSkillRetried: false,
@@ -2073,7 +2109,7 @@ const plugin: OpenClawPluginDefinition = {
 
     if (!selected.length) return;
 
-    const taskExcerpt = sanitizeValue(scrubSecrets(taskText), 200);
+    const taskExcerpt = sanitizeValue(scrubSecrets(taskText, piiEnabled), 200, piiEnabled);
     for (const skill of selected) {
       const isOverride = hasOverride.some((entry) => entry.name.toLowerCase() === skill.name.toLowerCase());
       const row = isOverride ? { score: 0, reason: "override" } : scoreSkill(taskText, skill, routerSkillKeywords, idf, avgDescLen);
@@ -2132,7 +2168,7 @@ const plugin: OpenClawPluginDefinition = {
       ...buildBase(event as { sessionId?: string; runId?: string }, ctx),
       toolName,
       toolCallId: toStringLike((event as RawEvent).toolCallId),
-      params: includeToolParams ? buildToolParams(toolName, params, redactKeys) : undefined,
+      params: includeToolParams ? buildToolParams(toolName, params, redactKeys, piiEnabled) : undefined,
     });
 
     const scopeKeys = buildScopeKeys(ctx, event);
@@ -2162,7 +2198,7 @@ const plugin: OpenClawPluginDefinition = {
       ...buildBase(event as { sessionId?: string; runId?: string }, ctx),
       toolName,
       toolCallId: toStringLike((event as RawEvent).toolCallId),
-      params: includeToolParams ? buildToolParams(toolName, params, redactKeys) : undefined,
+      params: includeToolParams ? buildToolParams(toolName, params, redactKeys, piiEnabled) : undefined,
       durationMs: typeof (event as RawEvent).durationMs === "number" ? Number((event as RawEvent).durationMs) : undefined,
       success: (event as RawEvent).error ? 0 : 1,
       error: toStringLike((event as RawEvent).error),
@@ -2177,7 +2213,7 @@ const plugin: OpenClawPluginDefinition = {
 
     const scopeKeys = buildScopeKeys(ctx, event);
     const execution = pickExecution(scopeKeys, true);
-    const msg = makeMessageCapture(text, "user", (event as RawEvent).metadata, redactKeys, captureMessageContent, detectMessageSignals(execution, text));
+    const msg = makeMessageCapture(text, "user", (event as RawEvent).metadata, redactKeys, captureMessageContent, detectMessageSignals(execution, text, "user"), piiEnabled);
     if (!msg) return;
 
     const scope = buildMessageScope(ctx, event);
@@ -2194,7 +2230,7 @@ const plugin: OpenClawPluginDefinition = {
 
     const scopeKeys = buildScopeKeys(ctx, event);
     const execution = pickExecution(scopeKeys, true);
-    const msg = makeMessageCapture(text, "assistant", (event as RawEvent).metadata, redactKeys, captureMessageContent, detectMessageSignals(execution, text));
+    const msg = makeMessageCapture(text, "assistant", (event as RawEvent).metadata, redactKeys, captureMessageContent, detectMessageSignals(execution, text, "assistant"), piiEnabled);
     if (!msg) return;
 
     const scope = buildMessageScope(ctx, event);
@@ -2293,6 +2329,4 @@ const plugin: OpenClawPluginDefinition = {
   sharedState.initialized = true;
   log.info("skill-usage-audit plugin registered");
   },
-};
-
-export default plugin;
+});
