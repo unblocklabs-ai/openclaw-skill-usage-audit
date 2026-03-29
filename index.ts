@@ -212,6 +212,26 @@ interface DbState {
   error?: string;
 }
 
+interface SkillUsageAuditGlobalState {
+  initialized: boolean;
+  db: DbState;
+  dbInitPromise: Promise<DbState> | null;
+  dbPath: string | null;
+  skipModeLog: Set<string>;
+}
+
+const skillUsageAuditGlobalAccessor = globalThis as unknown as {
+  __skillUsageAuditState?: SkillUsageAuditGlobalState;
+};
+
+skillUsageAuditGlobalAccessor.__skillUsageAuditState ??= {
+  initialized: false,
+  db: { backend: null, statements: null },
+  dbInitPromise: null,
+  dbPath: null,
+  skipModeLog: new Set<string>(),
+};
+
 function resolveHomePath(pathLike: string): string {
   if (!pathLike.startsWith("~")) return resolve(pathLike);
   const home = process.env.HOME || process.env.USERPROFILE;
@@ -1271,67 +1291,94 @@ const plugin: OpenClawPluginDefinition = {
   name: "Skill Usage Audit",
   description: "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
   register(api: OpenClawPluginApi) {
-  const log = api.logger;
-  const cfg = (api.pluginConfig as PluginConfig) || {};
+    const log = api.logger;
+    const registrationMode = api.registrationMode || "full";
+    const sharedState = skillUsageAuditGlobalAccessor.__skillUsageAuditState!;
 
-  const includeToolParams = cfg.includeToolParams ?? DEFAULT_INCLUDE_TOOL_PARAMS;
-  const captureMessageContent = cfg.captureMessageContent === undefined ? DEFAULT_CAPTURE_MESSAGE_CONTENT : cfg.captureMessageContent === true;
-  const redactKeys = new Set((Array.isArray(cfg.redactKeys) ? cfg.redactKeys : DEFAULT_REDACT_KEYS).map((k) => String(k).toLowerCase()));
-  const contextWindowSize = parseIntConfig(cfg.contextWindowSize, DEFAULT_CONTEXT_WINDOW_SIZE, 1);
-  const contextTimeoutMs = parseIntConfig(cfg.contextTimeoutMs, DEFAULT_CONTEXT_TIMEOUT_MS, 0);
-  const detectSkillBlocks = cfg.skillBlockDetection !== false;
-  const dbPath = resolveDbPath(cfg.dbPath);
-
-  const routerConfig = cfg.router || {} as RouterConfig;
-  const routerEnabled = parseBooleanConfig(routerConfig.enabled, true);
-  const routerTargets = routerConfig.targets || {};
-  const routerTargetSubagent = parseBooleanConfig(routerTargets.subagent, true);
-  const routerTargetCron = parseBooleanConfig(routerTargets.cron, true);
-  const routerMaxSkillsToNudge = parseIntConfig(routerConfig.maxSkillsToNudge, DEFAULT_ROUTER_MAX_SKILLS, 1);
-  const routerMinScore = parseFloatConfig(routerConfig.minScore, DEFAULT_ROUTER_MIN_SCORE, 0);
-  const routerRecencyWindow = parseIntConfig(routerConfig.recencyWindow, DEFAULT_ROUTER_RECENCY_WINDOW, 1);
-  const routerOverrides = parseOverrideRules(routerConfig.overrides).map((entry) => {
-    try {
-      return { ...entry, matcher: new RegExp(entry.taskPattern, "i") };
-    } catch (error) {
-      log.error(`skill-usage-audit: invalid override taskPattern: ${String(entry.taskPattern)} (${String(error)})`);
-      return undefined;
+    if (registrationMode !== "full") {
+      if (!sharedState.skipModeLog.has(registrationMode)) {
+        log.debug?.(`skill-usage-audit: skipping init (registrationMode=${registrationMode})`);
+        sharedState.skipModeLog.add(registrationMode);
+      }
+      return;
     }
-  }).filter((entry): entry is RouterOverride & { matcher: RegExp } => Boolean(entry));
-  const routerSkillKeywords = parseSkillKeywords(routerConfig.skillKeywords);
-  const routerBlocklist = new Set(parseBlocklist(routerConfig.blocklist));
-  const pluginWorkspaceDir = resolveWorkspaceDir();
 
-  const dbState: DbState = { backend: null, statements: null };
-  const dbInitPromise = initSqlite(dbPath, log);
-  let dbChain = Promise.resolve<void>(undefined);
-  let hasLoggedDbIssue = false;
-  const DB_QUEUE_DROP_THRESHOLD = 500;
-  let dbQueueDepth = 0;
-  let hasLoggedDbQueueDrop = false;
+    if (sharedState.initialized) {
+      return;
+    }
 
-  let shutdownInProgress = false;
-  let shutdownPromise: Promise<void> | null = null;
+    const cfg = (api.pluginConfig as PluginConfig) || {};
 
-  const messageHistory = new Map<string, MessageHistoryEntry>();
-  let messageHistoryCounter = 0;
+    const includeToolParams = cfg.includeToolParams ?? DEFAULT_INCLUDE_TOOL_PARAMS;
+    const captureMessageContent = cfg.captureMessageContent === undefined ? DEFAULT_CAPTURE_MESSAGE_CONTENT : cfg.captureMessageContent === true;
+    const redactKeys = new Set((Array.isArray(cfg.redactKeys) ? cfg.redactKeys : DEFAULT_REDACT_KEYS).map((k) => String(k).toLowerCase()));
+    const contextWindowSize = parseIntConfig(cfg.contextWindowSize, DEFAULT_CONTEXT_WINDOW_SIZE, 1);
+    const contextTimeoutMs = parseIntConfig(cfg.contextTimeoutMs, DEFAULT_CONTEXT_TIMEOUT_MS, 0);
+    const detectSkillBlocks = cfg.skillBlockDetection !== false;
+    const dbPath = resolveDbPath(cfg.dbPath);
 
-  const executionsById = new Map<number, SkillExecutionState>();
-  const execByScope = new Map<string, SkillExecutionState[]>();
-  const execByTool = new Map<string, number>();
-  let executionSeq = 0;
+    if (!sharedState.dbPath) {
+      sharedState.dbPath = dbPath;
+    }
 
-  async function ensureDbReady(): Promise<DbState> {
+    const dbState = sharedState.db;
+    let dbInitPromise = sharedState.dbInitPromise;
+    let dbChain = Promise.resolve<void>(undefined);
+    let hasLoggedDbIssue = false;
+    const DB_QUEUE_DROP_THRESHOLD = 500;
+    let dbQueueDepth = 0;
+    let hasLoggedDbQueueDrop = false;
+
+    let shutdownInProgress = false;
+    let shutdownPromise: Promise<void> | null = null;
+
+    const routerConfig = cfg.router || {} as RouterConfig;
+    const routerEnabled = parseBooleanConfig(routerConfig.enabled, true);
+    const routerTargets = routerConfig.targets || {};
+    const routerTargetSubagent = parseBooleanConfig(routerTargets.subagent, true);
+    const routerTargetCron = parseBooleanConfig(routerTargets.cron, true);
+    const routerMaxSkillsToNudge = parseIntConfig(routerConfig.maxSkillsToNudge, DEFAULT_ROUTER_MAX_SKILLS, 1);
+    const routerMinScore = parseFloatConfig(routerConfig.minScore, DEFAULT_ROUTER_MIN_SCORE, 0);
+    const routerRecencyWindow = parseIntConfig(routerConfig.recencyWindow, DEFAULT_ROUTER_RECENCY_WINDOW, 1);
+    const routerOverrides = parseOverrideRules(routerConfig.overrides).map((entry) => {
+      try {
+        return { ...entry, matcher: new RegExp(entry.taskPattern, "i") };
+      } catch (error) {
+        log.error(`skill-usage-audit: invalid override taskPattern: ${String(entry.taskPattern)} (${String(error)})`);
+        return undefined;
+      }
+    }).filter((entry): entry is RouterOverride & { matcher: RegExp } => Boolean(entry));
+    const routerSkillKeywords = parseSkillKeywords(routerConfig.skillKeywords);
+    const routerBlocklist = new Set(parseBlocklist(routerConfig.blocklist));
+    const pluginWorkspaceDir = resolveWorkspaceDir();
+
+    const messageHistory = new Map<string, MessageHistoryEntry>();
+    let messageHistoryCounter = 0;
+
+    const executionsById = new Map<number, SkillExecutionState>();
+    const execByScope = new Map<string, SkillExecutionState[]>();
+    const execByTool = new Map<string, number>();
+    let executionSeq = 0;
+
+    async function ensureDbReady(): Promise<DbState> {
     if (dbState.backend || dbState.statements || dbState.error) {
       return dbState;
     }
 
-    const state = await dbInitPromise;
-    if (!dbState.statements) {
-      dbState.backend = state.backend;
-      dbState.statements = state.statements;
-      dbState.error = state.error;
+    if (!dbInitPromise) {
+      const initPath = sharedState.dbPath || dbPath;
+      dbInitPromise = initSqlite(initPath, log).then((state) => {
+        if (!dbState.backend && !dbState.statements && dbState.error === undefined) {
+          dbState.backend = state.backend;
+          dbState.statements = state.statements;
+          dbState.error = state.error;
+        }
+        return state;
+      });
+      sharedState.dbInitPromise = dbInitPromise;
     }
+
+    const state = await dbInitPromise;
 
     if (state.error && !hasLoggedDbIssue) {
       hasLoggedDbIssue = true;
@@ -2239,14 +2286,11 @@ const plugin: OpenClawPluginDefinition = {
   }
 
   // Use gateway_stop lifecycle hook instead of process signal handlers.
-  // Calling process.exit() from an in-process plugin can short-circuit
-  // the gateway's own shutdown ordering and destabilize other plugins.
   api.on("gateway_stop", async () => {
     await requestFlush("gateway_stop");
   });
 
-  // eager init for logs
-  void ensureDbReady();
+  sharedState.initialized = true;
   log.info("skill-usage-audit plugin registered");
   },
 };
