@@ -5,6 +5,8 @@
 
 OpenClaw plugin that tracks skill/tool usage telemetry **and** automatically nudges sub-agents + cron runs toward relevant skills.
 
+Lifecycle note: OpenClaw hook registration is **per registry**, not process-global. This plugin shares SQLite init/runtime state across the process, but binds `api.on(...)` hooks once for each `registrationMode=full` API instance.
+
 ---
 
 ## Features

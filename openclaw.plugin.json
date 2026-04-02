@@ -2,7 +2,7 @@
   "id": "skill-usage-audit",
   "name": "Skill Usage Audit",
   "description": "Skill usage telemetry, execution tracking, and intelligent skill routing for OpenClaw. Writes audit data to SQLite.",
-  "version": "1.1.0",
+  "version": "1.1.4",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

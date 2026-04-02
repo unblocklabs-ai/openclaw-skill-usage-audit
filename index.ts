@@ -3,7 +3,7 @@
  */
 
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
-import { dirname, basename, resolve, join, relative, sep } from "node:path";
+import { dirname, basename, resolve, join, relative, sep, isAbsolute } from "node:path";
 
 import { createHash } from "node:crypto";
 
@@ -215,12 +215,23 @@ interface DbState {
   error?: string;
 }
 
+interface SharedShutdownParticipant {
+  flush: (reason: string) => void;
+}
+
 interface SkillUsageAuditGlobalState {
-  initialized: boolean;
   db: DbState;
   dbInitPromise: Promise<DbState> | null;
   dbPath: string | null;
+  dbChain: Promise<void>;
+  dbQueueDepth: number;
+  hasLoggedDbQueueDrop: boolean;
+  acceptingWrites: boolean;
+  shutdownPromise: Promise<void> | null;
+  shutdownParticipants: Set<SharedShutdownParticipant>;
+  registeredFullApis: WeakSet<object>;
   skipModeLog: Set<string>;
+  warnedDbPaths: Set<string>;
 }
 
 const skillUsageAuditGlobalAccessor = globalThis as unknown as {
@@ -228,11 +239,18 @@ const skillUsageAuditGlobalAccessor = globalThis as unknown as {
 };
 
 skillUsageAuditGlobalAccessor.__skillUsageAuditState ??= {
-  initialized: false,
   db: { backend: null, statements: null },
   dbInitPromise: null,
   dbPath: null,
+  dbChain: Promise.resolve<void>(undefined),
+  dbQueueDepth: 0,
+  hasLoggedDbQueueDrop: false,
+  acceptingWrites: true,
+  shutdownPromise: null,
+  shutdownParticipants: new Set<SharedShutdownParticipant>(),
+  registeredFullApis: new WeakSet<object>(),
   skipModeLog: new Set<string>(),
+  warnedDbPaths: new Set<string>(),
 };
 
 function resolveHomePath(pathLike: string): string {
@@ -240,6 +258,35 @@ function resolveHomePath(pathLike: string): string {
   const home = process.env.HOME || process.env.USERPROFILE;
   if (!home) return resolve(pathLike);
   return resolve(home, pathLike.slice(2));
+}
+
+function isHomeRelativePath(pathLike: string): boolean {
+  return pathLike === "~" || pathLike.startsWith("~/") || pathLike.startsWith("~\\");
+}
+
+function canonicalSkillPath(rawPath: string | undefined): string | undefined {
+  if (!rawPath) return undefined;
+  const trimmed = rawPath.trim();
+  if (!trimmed) return undefined;
+  if (isHomeRelativePath(trimmed)) return resolveHomePath(trimmed);
+  if (isAbsolute(trimmed)) return resolve(trimmed);
+  return undefined;
+}
+
+function getSkillNameFromReference(skillRef: string): string {
+  const normalized = skillRef.replace(/\\/g, "/");
+  const trimmed = normalized.trim();
+  if (!trimmed) return "unknown";
+
+  if (trimmed.toLowerCase().endsWith("skill.md")) {
+    const parts = trimmed.split("/").filter(Boolean);
+    if (parts.length >= 2) {
+      return parts[parts.length - 2] || "unknown";
+    }
+  }
+
+  const parts = trimmed.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "unknown";
 }
 
 
@@ -440,15 +487,20 @@ function makeMessageCapture(
 }
 
 function inferSkillName(skillPath: string): string {
-  const resolved = skillPath.startsWith("~") ? resolveHomePath(skillPath) : resolve(skillPath);
-  if (basename(resolved).toLowerCase() === "skill.md") {
-    return basename(dirname(resolved));
+  const canonical = canonicalSkillPath(skillPath);
+  if (canonical) {
+    if (basename(canonical).toLowerCase() === "skill.md") {
+      return basename(dirname(canonical));
+    }
+    return basename(canonical);
   }
-  return basename(resolved);
+
+  return getSkillNameFromReference(skillPath);
 }
 
 function inferSkillSource(skillPath: string): string {
-  const abs = skillPath.startsWith("~") ? resolveHomePath(skillPath) : resolve(skillPath);
+  const abs = canonicalSkillPath(skillPath);
+  if (!abs) return "unknown";
   const home = resolve(process.env.HOME || process.env.USERPROFILE || "");
   if (abs.includes(`${home}/.openclaw/extensions`) || abs.includes(`${home}/.openclaw/extensions/`)) return "extension";
   if (abs.includes(`${home}/.openclaw/skills`) || abs.includes(`${home}/.openclaw/skills/`)) return "bundled";
@@ -763,8 +815,8 @@ async function collectSkillCandidatesFromRoot(root: string): Promise<SkillCandid
     try {
       const raw = await readFile(skillPath, "utf8");
       frontmatter = parseFrontmatterFromSkillMd(raw);
-    } catch (err) {
-      log.debug?.(`skill-usage-audit: readFile SKILL.md failed for ${skillPath}: ${String(err)}`);
+    } catch {
+      // Skip skills with unreadable SKILL.md files
       continue;
     }
 
@@ -939,7 +991,7 @@ function formatNudge(skills: SkillCandidate[]): string {
   return lines.join("\n");
 }
 
-function createPreparedStatements(db: SqliteBackend): DbPrepared {
+function createPreparedStatements(db: SqliteBackend, log: { debug?: (msg: string) => void }): DbPrepared {
   const insertEvent = db.prepare(`
     INSERT INTO skill_events (
       ts, type, session_id, session_key, run_id, agent_id, channel_id, message_provider,
@@ -1270,14 +1322,17 @@ async function initSqlite(path: string, log: { info: (msg: string) => void; erro
   log.info(`skill-usage-audit: sqlite initialized at ${path} (${backend.kind})`);
   return {
     backend,
-    statements: createPreparedStatements(backend),
+    statements: createPreparedStatements(backend, log),
   } as DbState;
 }
 
 async function computeSkillVersionHash(skillPath: string): Promise<string | null> {
-  const dir = resolve(dirname(skillPath));
+  const canonicalPath = canonicalSkillPath(skillPath);
+  if (!canonicalPath) return null;
+
+  const dir = dirname(canonicalPath);
   const scriptDir = join(dir, "scripts");
-  const files: string[] = [skillPath];
+  const files: string[] = [canonicalPath];
   try {
     const statDir = await stat(scriptDir);
     if (statDir.isDirectory()) {
@@ -1319,6 +1374,7 @@ export default definePluginEntry({
     const log = api.logger;
     const registrationMode = api.registrationMode || "full";
     const sharedState = skillUsageAuditGlobalAccessor.__skillUsageAuditState!;
+    const apiRegistrationToken = api as unknown as object;
 
     if (registrationMode !== "full") {
       if (!sharedState.skipModeLog.has(registrationMode)) {
@@ -1328,7 +1384,7 @@ export default definePluginEntry({
       return;
     }
 
-    if (sharedState.initialized) {
+    if (sharedState.registeredFullApis.has(apiRegistrationToken)) {
       return;
     }
 
@@ -1345,18 +1401,14 @@ export default definePluginEntry({
 
     if (!sharedState.dbPath) {
       sharedState.dbPath = dbPath;
+    } else if (sharedState.dbPath !== dbPath && !sharedState.warnedDbPaths.has(dbPath)) {
+      log.warn?.(`skill-usage-audit: ignoring dbPath=${dbPath} for additional full registration; using shared dbPath=${sharedState.dbPath}`);
+      sharedState.warnedDbPaths.add(dbPath);
     }
 
     const dbState = sharedState.db;
-    let dbInitPromise = sharedState.dbInitPromise;
-    let dbChain = Promise.resolve<void>(undefined);
     let hasLoggedDbIssue = false;
     const DB_QUEUE_DROP_THRESHOLD = 500;
-    let dbQueueDepth = 0;
-    let hasLoggedDbQueueDrop = false;
-
-    let shutdownInProgress = false;
-    let shutdownPromise: Promise<void> | null = null;
 
     const routerConfig = cfg.router || {} as RouterConfig;
     const routerEnabled = parseBooleanConfig(routerConfig.enabled, true);
@@ -1391,60 +1443,58 @@ export default definePluginEntry({
     let executionCleanupCounter = 0;
 
     async function ensureDbReady(): Promise<DbState> {
-    if (dbState.backend || dbState.statements || dbState.error) {
+      if (dbState.backend || dbState.statements || dbState.error) {
+        return dbState;
+      }
+
+      if (!sharedState.dbInitPromise) {
+        const initPath = sharedState.dbPath || dbPath;
+        sharedState.dbInitPromise = initSqlite(initPath, log).then((state) => {
+          if (!dbState.backend && !dbState.statements && dbState.error === undefined) {
+            dbState.backend = state.backend;
+            dbState.statements = state.statements;
+            dbState.error = state.error;
+          }
+          return state;
+        });
+      }
+
+      const state = await sharedState.dbInitPromise;
+
+      if (state.error && !hasLoggedDbIssue) {
+        hasLoggedDbIssue = true;
+        log.info(`skill-usage-audit: sqlite unavailable: ${state.error}`);
+      }
+
       return dbState;
     }
 
-    if (!dbInitPromise) {
-      const initPath = sharedState.dbPath || dbPath;
-      dbInitPromise = initSqlite(initPath, log).then((state) => {
-        if (!dbState.backend && !dbState.statements && dbState.error === undefined) {
-          dbState.backend = state.backend;
-          dbState.statements = state.statements;
-          dbState.error = state.error;
+    function scheduleDbWrite(label: string, critical: boolean, write: () => Promise<void> | void): void {
+      if (!sharedState.acceptingWrites) return;
+
+      if (!critical && sharedState.dbQueueDepth >= DB_QUEUE_DROP_THRESHOLD) {
+        if (!sharedState.hasLoggedDbQueueDrop) {
+          sharedState.hasLoggedDbQueueDrop = true;
+          log.info(`skill-usage-audit: db queue backlog high (${sharedState.dbQueueDepth}); dropping non-critical inserts`);
         }
-        return state;
-      });
-      sharedState.dbInitPromise = dbInitPromise;
-    }
-
-    const state = await dbInitPromise;
-
-    if (state.error && !hasLoggedDbIssue) {
-      hasLoggedDbIssue = true;
-      log.info(`skill-usage-audit: sqlite unavailable: ${state.error}`);
-    }
-
-    return dbState;
-  }
-
-  function scheduleDbWrite(label: string, critical: boolean, write: () => Promise<void> | void): void {
-    if (shutdownInProgress) return;
-
-    if (!critical && dbQueueDepth >= DB_QUEUE_DROP_THRESHOLD) {
-      if (!hasLoggedDbQueueDrop) {
-        hasLoggedDbQueueDrop = true;
-        log.info(`skill-usage-audit: db queue backlog high (${dbQueueDepth}); dropping non-critical inserts`);
+        return;
       }
-      return;
-    }
 
-    dbQueueDepth += 1;
-    dbChain = dbChain
-      .then(async () => write())
-      .catch((err) => {
-        log.error(`skill-usage-audit: ${label}: ${String(err)}`);
-      })
-      .finally(() => {
-        dbQueueDepth = Math.max(0, dbQueueDepth - 1);
-        if (dbQueueDepth < DB_QUEUE_DROP_THRESHOLD) {
-          hasLoggedDbQueueDrop = false;
-        }
-      });
-  }
+      sharedState.dbQueueDepth += 1;
+      sharedState.dbChain = sharedState.dbChain
+        .then(async () => write())
+        .catch((err) => {
+          log.error(`skill-usage-audit: ${label}: ${String(err)}`);
+        })
+        .finally(() => {
+          sharedState.dbQueueDepth = Math.max(0, sharedState.dbQueueDepth - 1);
+          if (sharedState.dbQueueDepth < DB_QUEUE_DROP_THRESHOLD) {
+            sharedState.hasLoggedDbQueueDrop = false;
+          }
+        });
+    }
 
   function queueDbInsert(rowType: RawEvent): void {
-    if (shutdownInProgress) return;
     if (rowType.type !== "session_start" && rowType.type !== "session_end" && rowType.type !== "tool_call_start" && rowType.type !== "tool_call_end" && rowType.type !== "skill_file_read" && rowType.type !== "skill_block_detected") {
       return;
     }
@@ -1488,18 +1538,19 @@ export default definePluginEntry({
   }
 
   function queueSkillVersionWrite(skillName: string, skillPath: string, ts: string, versionHash: string | null | undefined): void {
-    if (shutdownInProgress) return;
-
     scheduleDbWrite("failed writing skill version", true, async () => {
       const state = await ensureDbReady();
       if (!state.statements) return;
 
-      const hash = versionHash ?? (await computeSkillVersionHash(skillPath));
+      const canonicalPath = normalizeSkillExecutionPath(skillPath);
+      if (!canonicalPath) return;
+
+      const hash = versionHash ?? (await computeSkillVersionHash(canonicalPath));
       if (!hash) return;
 
       state.statements.insertVersion({
         skill_name: skillName,
-        skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
+        skill_path: canonicalPath,
         version_hash: hash,
         first_seen_at: ts,
         notes: null,
@@ -1507,7 +1558,7 @@ export default definePluginEntry({
 
       state.statements.upsertSkill({
         skill_name: skillName,
-        skill_path: normalizeSkillExecutionPath(skillPath) || resolve(skillPath),
+        skill_path: canonicalPath,
         current_version_hash: hash,
         status: "stable",
         last_modified_at: ts,
@@ -1526,8 +1577,6 @@ export default definePluginEntry({
     turnNumber: number | null;
     taskExcerpt: string;
   }): void {
-    if (shutdownInProgress) return;
-
     scheduleDbWrite("failed writing nudge", true, async () => {
       const state = await ensureDbReady();
       if (!state.statements) return;
@@ -1753,10 +1802,7 @@ export default definePluginEntry({
   }
 
   function normalizeSkillExecutionPath(rawPath: string | undefined): string | undefined {
-    if (!rawPath) return undefined;
-    const trimmed = rawPath.trim();
-    if (!trimmed) return undefined;
-    return trimmed.startsWith("~") ? resolveHomePath(trimmed) : resolve(trimmed);
+    return canonicalSkillPath(rawPath);
   }
 
   function resolveSkillPathFromBlock(name: string, location: string | undefined): string | undefined {
@@ -2185,8 +2231,7 @@ export default definePluginEntry({
     const skillPath = extractSkillPathFromParams(params);
 
     if (toolName === "read" && skillPath) {
-      const normalized = normalizeSkillExecutionPath(skillPath) || resolve(skillPath);
-      const execution = startExecutionFromSkillRead(ctx, event as RawEvent, normalized, now);
+      const execution = startExecutionFromSkillRead(ctx, event as RawEvent, skillPath, now);
       attachToolCall(scopeKeys, event as RawEvent, execution);
       return;
     }
@@ -2272,7 +2317,7 @@ export default definePluginEntry({
           });
 
           for (const block of info.blocks) {
-            const resolvedPath = resolveSkillPathFromBlock(block.name, block.location) || block.location || block.name;
+            const resolvedPath = resolveSkillPathFromBlock(block.name, block.location);
             if (!resolvedPath) continue;
             startExecutionFromSkillRead(ctx, event as RawEvent, resolvedPath, timestamp, true);
           }
@@ -2303,11 +2348,27 @@ export default definePluginEntry({
     }
   }
 
+  const shutdownParticipant: SharedShutdownParticipant = {
+    flush: (reason: string) => {
+      finalizeAllExecutions(reason);
+    },
+  };
+
+  sharedState.shutdownParticipants.add(shutdownParticipant);
+
   async function flushPendingWrites(reason: string): Promise<void> {
-    finalizeAllExecutions(reason);
+    for (const participant of [...sharedState.shutdownParticipants]) {
+      try {
+        participant.flush(reason);
+      } catch (err) {
+        log.error(`skill-usage-audit: shutdown finalize failed: ${String(err)}`);
+      }
+    }
+
+    sharedState.acceptingWrites = false;
 
     try {
-      await withTimeout(dbChain, 2500);
+      await withTimeout(sharedState.dbChain, 2500);
     } catch (err) {
       log.error(`skill-usage-audit: shutdown flush failed: ${String(err)}`);
     }
@@ -2321,14 +2382,15 @@ export default definePluginEntry({
       dbState.backend = null;
       dbState.statements = null;
     }
+
+    sharedState.dbInitPromise = null;
   }
 
   function requestFlush(reason: string): Promise<void> {
-    if (!shutdownPromise) {
-      shutdownInProgress = true;
-      shutdownPromise = flushPendingWrites(reason);
+    if (!sharedState.shutdownPromise) {
+      sharedState.shutdownPromise = flushPendingWrites(reason);
     }
-    return shutdownPromise;
+    return sharedState.shutdownPromise;
   }
 
   // Use gateway_stop lifecycle hook instead of process signal handlers.
@@ -2336,7 +2398,7 @@ export default definePluginEntry({
     await requestFlush("gateway_stop");
   });
 
-  sharedState.initialized = true;
-  log.info("skill-usage-audit plugin registered");
+  sharedState.registeredFullApis.add(apiRegistrationToken);
+  log.info(`skill-usage-audit plugin registered (registrationMode=${registrationMode})`);
   },
 });
