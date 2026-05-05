@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/skill-usage-audit",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
   "type": "module",
   "keywords": [

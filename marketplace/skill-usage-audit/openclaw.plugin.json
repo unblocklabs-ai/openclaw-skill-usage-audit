@@ -2,7 +2,7 @@
   "id": "skill-usage-audit",
   "name": "Skill Usage Audit",
   "description": "Skill usage telemetry, execution tracking, and intelligent skill routing for OpenClaw. Writes audit data to SQLite.",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "activation": {
     "onStartup": true,
     "onCapabilities": [
@@ -162,7 +162,11 @@
           },
           "taskWindowMode": {
             "type": "string",
-            "enum": ["recentMessages", "latestUser", "promptOnly"],
+            "enum": [
+              "recentMessages",
+              "latestUser",
+              "promptOnly"
+            ],
             "default": "recentMessages",
             "description": "Which text window to score for routing"
           },
@@ -170,15 +174,42 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "workspace": { "type": "boolean", "default": true },
-              "agentsProject": { "type": "boolean", "default": true },
-              "agentsPersonal": { "type": "boolean", "default": true },
-              "openclawManaged": { "type": "boolean", "default": true },
-              "openclawBundled": { "type": "boolean", "default": true },
-              "extraDirs": { "type": "boolean", "default": true },
-              "openclawPluginSkills": { "type": "boolean", "default": true },
-              "codex": { "type": "boolean", "default": true },
-              "codexPlugin": { "type": "boolean", "default": true },
+              "workspace": {
+                "type": "boolean",
+                "default": true
+              },
+              "agentsProject": {
+                "type": "boolean",
+                "default": true
+              },
+              "agentsPersonal": {
+                "type": "boolean",
+                "default": true
+              },
+              "openclawManaged": {
+                "type": "boolean",
+                "default": true
+              },
+              "openclawBundled": {
+                "type": "boolean",
+                "default": true
+              },
+              "extraDirs": {
+                "type": "boolean",
+                "default": true
+              },
+              "openclawPluginSkills": {
+                "type": "boolean",
+                "default": true
+              },
+              "codex": {
+                "type": "boolean",
+                "default": true
+              },
+              "codexPlugin": {
+                "type": "boolean",
+                "default": true
+              },
               "groupDepth": {
                 "type": "integer",
                 "minimum": 0,
@@ -241,7 +272,10 @@
                   }
                 }
               },
-              "required": ["taskPattern", "skills"]
+              "required": [
+                "taskPattern",
+                "skills"
+              ]
             },
             "default": []
           },
