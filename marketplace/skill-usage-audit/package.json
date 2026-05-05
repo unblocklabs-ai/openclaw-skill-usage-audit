@@ -1,0 +1,58 @@
+{
+  "name": "@unblocklabs/skill-usage-audit",
+  "version": "1.1.4",
+  "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git"
+  },
+  "homepage": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit",
+  "bugs": {
+    "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "skill-audit",
+    "telemetry",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "author": "Unblock Labs",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "better-sqlite3": ">=11.0.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.3",
+      "minGatewayVersion": "2026.5.3"
+    },
+    "install": {
+      "npmSpec": "@unblocklabs/skill-usage-audit",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.5.3"
+    },
+    "release": {
+      "publishToClawHub": false,
+      "publishToNpm": true
+    }
+  },
+  "files": [
+    "index.ts",
+    "skill-roots.mjs",
+    "skill-router-helpers.mjs",
+    "evaluate-skill-health.mjs",
+    "evaluate-nudge-health.mjs",
+    "docs/skill-usage-audit-banner.webp",
+    "README.md",
+    "openclaw.plugin.json"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "submoduleRoot": ".",
+  "fixtures": [
+    {
+      "id": "skill-usage-audit",
+      "name": "Skill Usage Audit",
+      "path": ".",
+      "repo": "local",
+      "priority": "high",
+      "seams": ["plugin-runtime"],
+      "why": "skill telemetry and router plugin loaded through OpenClaw runtime hooks"
+    }
+  ]
+}

@@ -2,11 +2,7 @@
   "name": "@unblocklabs/skill-usage-audit",
   "version": "1.1.4",
   "description": "Writes tool and skill usage telemetry to SQLite for audit and self-improving skill lifecycle.",
-  "openclaw": {
-    "extensions": [
-      "index.ts"
-    ]
-  },
+  "type": "module",
   "keywords": [
     "openclaw",
     "plugin",
@@ -27,16 +23,58 @@
   "engines": {
     "node": ">=22"
   },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run preflight",
+    "check:runtime": "npm test && npm run check:entrypoint && node evaluate-skill-health.mjs --help && node evaluate-nudge-health.mjs --help",
+    "check:entrypoint": "node --experimental-strip-types scripts/smoke-openclaw-entrypoint.mjs",
+    "check:inspector": "node scripts/check-inspector.mjs",
+    "marketplace:sync": "node scripts/sync-marketplace-package.mjs",
+    "marketplace:check": "node scripts/sync-marketplace-package.mjs --check",
+    "check:install": "npm run marketplace:check && node scripts/check-install.mjs",
+    "check:package": "npm pack --dry-run",
+    "pack:check": "npm pack --dry-run",
+    "preflight": "npm run check:runtime && npm run marketplace:sync && npm run check:inspector && npm run check:install && npm run pack:check",
+    "release": "node scripts/release.mjs",
+    "release:patch": "node scripts/release.mjs patch",
+    "release:minor": "node scripts/release.mjs minor",
+    "release:major": "node scripts/release.mjs major"
+  },
   "dependencies": {},
-  "devDependencies": {},
+  "devDependencies": {
+    "@openclaw/plugin-inspector": "^0.3.10",
+    "openclaw": "2026.5.3"
+  },
   "optionalDependencies": {
     "better-sqlite3": ">=11.0.0"
   },
   "files": [
     "index.ts",
+    "skill-roots.mjs",
+    "skill-router-helpers.mjs",
     "openclaw.plugin.json",
     "evaluate-skill-health.mjs",
     "evaluate-nudge-health.mjs",
-    "README.md"
-  ]
+    "README.md",
+    "docs/skill-usage-audit-banner.webp",
+    ".claude-plugin/marketplace.json"
+  ],
+  "openclaw": {
+    "extensions": [
+      "index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.3",
+      "minGatewayVersion": "2026.5.3"
+    },
+    "install": {
+      "npmSpec": "@unblocklabs/skill-usage-audit",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.5.3"
+    },
+    "release": {
+      "publishToClawHub": false,
+      "publishToNpm": true
+    }
+  }
 }
