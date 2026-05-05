@@ -14,7 +14,7 @@
   "homepage": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit",
   "repository": {
     "type": "git",
-    "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git"
+    "url": "git+https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git"
   },
   "bugs": {
     "url": "https://github.com/unblocklabs-ai/openclaw-skill-usage-audit/issues"

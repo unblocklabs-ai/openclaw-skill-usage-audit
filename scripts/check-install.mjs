@@ -40,6 +40,10 @@ if (!Array.isArray(packageJson.openclaw?.extensions) || packageJson.openclaw.ext
   fail("package.json missing openclaw.extensions");
 }
 
+if (packageJson.repository?.url !== "git+https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git") {
+  fail("package.json repository.url must use npm's canonical git+https form");
+}
+
 for (const extension of packageJson.openclaw.extensions) {
   if (typeof extension !== "string" || !extension.trim()) {
     fail("package.json openclaw.extensions contains an invalid entry");
@@ -85,6 +89,9 @@ if (marketplacePlugin.source !== MARKETPLACE_SOURCE) {
 
 const marketplacePackage = readJson(path.join(MARKETPLACE_SOURCE, "package.json"));
 const marketplacePluginManifest = readJson(path.join(MARKETPLACE_SOURCE, "openclaw.plugin.json"));
+if (marketplacePackage.repository?.url !== packageJson.repository?.url) {
+  fail("Marketplace package repository.url must match package.json");
+}
 if (marketplacePackage.version !== packageJson.version) {
   fail(`Version mismatch: marketplace package=${marketplacePackage.version} package.json=${packageJson.version}`);
 }
