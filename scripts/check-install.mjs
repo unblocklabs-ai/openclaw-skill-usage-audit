@@ -6,9 +6,9 @@ import path from "node:path";
 const ROOT = process.cwd();
 const MARKETPLACE_SOURCE = "marketplace/skill-usage-audit";
 const RUNTIME_FILES = [
-  "index.ts",
-  "skill-roots.mjs",
-  "skill-router-helpers.mjs",
+  "dist/index.js",
+  "dist/skill-roots.mjs",
+  "dist/skill-router-helpers.mjs",
   "evaluate-skill-health.mjs",
   "evaluate-nudge-health.mjs",
 ];
@@ -36,17 +36,25 @@ const packageJson = readJson("package.json");
 const pluginManifest = readJson("openclaw.plugin.json");
 const marketplace = readJson(".claude-plugin/marketplace.json");
 
-if (!Array.isArray(packageJson.openclaw?.extensions) || packageJson.openclaw.extensions.length === 0) {
-  fail("package.json missing openclaw.extensions");
+if (packageJson.main !== "./dist/index.js") {
+  fail("package.json main must point to ./dist/index.js");
+}
+
+if (packageJson.exports?.["."] !== "./dist/index.js") {
+  fail('package.json exports["."] must point to ./dist/index.js');
+}
+
+if (!Array.isArray(packageJson.openclaw?.runtimeExtensions) || packageJson.openclaw.runtimeExtensions.length === 0) {
+  fail("package.json missing openclaw.runtimeExtensions");
 }
 
 if (packageJson.repository?.url !== "git+https://github.com/unblocklabs-ai/openclaw-skill-usage-audit.git") {
   fail("package.json repository.url must use npm's canonical git+https form");
 }
 
-for (const extension of packageJson.openclaw.extensions) {
+for (const extension of packageJson.openclaw.runtimeExtensions) {
   if (typeof extension !== "string" || !extension.trim()) {
-    fail("package.json openclaw.extensions contains an invalid entry");
+    fail("package.json openclaw.runtimeExtensions contains an invalid entry");
   }
   assertFile(extension.replace(/^\.\//, ""));
 }
@@ -57,8 +65,8 @@ for (const file of ASSET_FILES) assertFile(file);
 if (!Array.isArray(packageJson.files)) {
   fail("package.json files must be an array");
 }
-for (const file of RUNTIME_FILES) {
-  if (!packageJson.files.includes(file)) fail(`package.json files must include ${file}`);
+if (!packageJson.files.includes("dist")) {
+  fail("package.json files must include dist");
 }
 for (const file of ASSET_FILES) {
   if (!packageJson.files.includes(file)) fail(`package.json files must include ${file}`);
@@ -94,6 +102,12 @@ if (marketplacePackage.repository?.url !== packageJson.repository?.url) {
 }
 if (marketplacePackage.version !== packageJson.version) {
   fail(`Version mismatch: marketplace package=${marketplacePackage.version} package.json=${packageJson.version}`);
+}
+if (marketplacePackage.main !== packageJson.main) {
+  fail("Marketplace package main must match package.json");
+}
+if (marketplacePackage.exports?.["."] !== packageJson.exports?.["."]) {
+  fail("Marketplace package exports must match package.json");
 }
 if (marketplacePackage.scripts || marketplacePackage.devDependencies) {
   fail("Marketplace package must not include development scripts or devDependencies");

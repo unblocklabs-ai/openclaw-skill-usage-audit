@@ -72,9 +72,9 @@ async function main() {
 
   const packageJson = await readJson(resolve(repoRoot, "package.json"));
   const manifest = await readJson(resolve(repoRoot, "openclaw.plugin.json"));
-  const packageEntries = packageJson?.openclaw?.extensions || [];
-  if (!Array.isArray(packageEntries) || !packageEntries.includes("index.ts")) {
-    fail("package.json openclaw.extensions must include index.ts");
+  const packageEntries = packageJson?.openclaw?.runtimeExtensions || [];
+  if (!Array.isArray(packageEntries) || !packageEntries.includes("./dist/index.js")) {
+    fail("package.json openclaw.runtimeExtensions must include ./dist/index.js");
   }
   if (manifest.id !== "skill-usage-audit") {
     fail(`openclaw.plugin.json id mismatch: ${String(manifest.id)}`);
@@ -85,12 +85,16 @@ async function main() {
     const pluginRoot = resolve(tempRoot, "plugin");
     await mkdir(resolve(pluginRoot, "node_modules"), { recursive: true });
 
-    for (const file of ["index.ts", "skill-roots.mjs", "skill-router-helpers.mjs", "package.json", "openclaw.plugin.json"]) {
+    await mkdir(resolve(pluginRoot, "dist"), { recursive: true });
+    for (const file of ["package.json", "openclaw.plugin.json"]) {
       await copyFile(resolve(repoRoot, file), resolve(pluginRoot, file));
+    }
+    for (const file of ["index.js", "skill-roots.mjs", "skill-router-helpers.mjs"]) {
+      await copyFile(resolve(repoRoot, "dist", file), resolve(pluginRoot, "dist", file));
     }
     await symlink(openClawCheckout, resolve(pluginRoot, "node_modules", "openclaw"));
 
-    const mod = await import(pathToFileURL(resolve(pluginRoot, "index.ts")).href);
+    const mod = await import(pathToFileURL(resolve(pluginRoot, "dist", "index.js")).href);
     const plugin = mod.default;
     assertEntryShape(plugin);
 

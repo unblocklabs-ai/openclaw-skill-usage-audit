@@ -221,7 +221,7 @@ The preflight runs tests, the OpenClaw entrypoint smoke check, install-shape che
 
 ## Repository Layout
 
-- `index.ts` registers the native plugin entry and runtime hooks.
+- `index.ts` is the TypeScript source for the compiled `dist/index.js` runtime entrypoint.
 - `skill-roots.mjs` discovers OpenClaw, Codex/OpenAI, workspace, and configured skill roots.
 - `skill-router-helpers.mjs` contains shared skill identity, routing config, and text-window helpers.
 - `evaluate-skill-health.mjs` computes skill health metrics from SQLite.

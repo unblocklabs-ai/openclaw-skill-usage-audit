@@ -23,13 +23,20 @@
   "engines": {
     "node": ">=22"
   },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "dependencies": {},
   "optionalDependencies": {
     "better-sqlite3": ">=11.0.0"
   },
   "openclaw": {
     "extensions": [
-      "index.ts"
+      "./dist/index.js"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
     ],
     "compat": {
       "pluginApi": ">=2026.5.3",
@@ -46,9 +53,7 @@
     }
   },
   "files": [
-    "index.ts",
-    "skill-roots.mjs",
-    "skill-router-helpers.mjs",
+    "dist",
     "evaluate-skill-health.mjs",
     "evaluate-nudge-health.mjs",
     "docs/skill-usage-audit-banner.webp",

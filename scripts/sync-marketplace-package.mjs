@@ -8,9 +8,9 @@ const ROOT = process.cwd();
 const MARKETPLACE_PACKAGE_DIR = path.join(ROOT, "marketplace", "skill-usage-audit");
 const CHECK_MODE = process.argv.includes("--check");
 const RUNTIME_FILES = [
-  "index.ts",
-  "skill-roots.mjs",
-  "skill-router-helpers.mjs",
+  "dist/index.js",
+  "dist/skill-roots.mjs",
+  "dist/skill-router-helpers.mjs",
   "evaluate-skill-health.mjs",
   "evaluate-nudge-health.mjs",
 ];
@@ -49,6 +49,8 @@ function buildMarketplacePackageJson() {
     "license",
     "author",
     "engines",
+    "main",
+    "exports",
     "dependencies",
     "optionalDependencies",
     "openclaw",
@@ -58,7 +60,9 @@ function buildMarketplacePackageJson() {
     if (packageJson[field] !== undefined) output[field] = packageJson[field];
   }
   output.files = [
-    ...RUNTIME_FILES,
+    "dist",
+    "evaluate-skill-health.mjs",
+    "evaluate-nudge-health.mjs",
     ...ASSET_FILES,
     "README.md",
     "openclaw.plugin.json",
@@ -79,7 +83,9 @@ function syncInto(targetDir) {
   fs.copyFileSync(path.join(ROOT, "README.md"), path.join(targetDir, "README.md"));
   fs.copyFileSync(path.join(ROOT, "openclaw.plugin.json"), path.join(targetDir, "openclaw.plugin.json"));
   for (const file of RUNTIME_FILES) {
-    fs.copyFileSync(path.join(ROOT, file), path.join(targetDir, file));
+    const targetPath = path.join(targetDir, file);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, file), targetPath);
   }
   for (const file of ASSET_FILES) {
     const targetPath = path.join(targetDir, file);
