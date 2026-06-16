@@ -50,7 +50,7 @@
   "devDependencies": {
     "@openclaw/plugin-inspector": "^0.3.10",
     "openclaw": "2026.5.3",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "optionalDependencies": {
     "better-sqlite3": ">=11.0.0"
