@@ -186,3 +186,100 @@ test("nudge evaluator reports router decision reasons", async (t) => {
   assert.equal(report.recentDecisions.length, 2);
   assert.equal(report.recentDecisions[0].top_candidates[0].skill_key, "github");
 });
+
+test("nudge evaluator reports classified funnel and portfolio queries without classifying history", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "nudge-funnel-report-"));
+  const dbPath = resolve(dir, "audit.db");
+  const db = openWritableDb(dbPath);
+  if (db.error) {
+    t.skip(`sqlite unavailable: ${String(db.error?.message || db.error)}`);
+    return;
+  }
+
+  const now = Date.now();
+  const ts = (daysAgo) => new Date(now - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+  db.exec(`
+    CREATE TABLE skill_nudges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nudge_id TEXT,
+      session_key TEXT,
+      session_id TEXT,
+      run_id TEXT,
+      skill_name TEXT NOT NULL,
+      skill_key TEXT,
+      outcome TEXT,
+      open_latency_ms INTEGER,
+      resources_used_count INTEGER DEFAULT 0,
+      timestamp TEXT
+    );
+    CREATE TABLE skill_router_catalog (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      skill_key TEXT NOT NULL,
+      skill_name TEXT NOT NULL,
+      skill_path TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+    INSERT INTO skill_router_catalog (skill_key, skill_name, skill_path, last_seen_at) VALUES
+      ('alpha', 'Alpha', '/skills/alpha/SKILL.md', '${ts(0)}'),
+      ('beta', 'Beta', '/skills/beta/SKILL.md', '${ts(0)}'),
+      ('gamma', 'Gamma', '/skills/gamma/SKILL.md', '${ts(0)}');
+    INSERT INTO skill_nudges (nudge_id, session_key, run_id, skill_name, skill_key, outcome, open_latency_ms, resources_used_count, timestamp) VALUES
+      ('n1', 'workflow-a', 'r1', 'Alpha', 'alpha', 'opened', 100, 2, '${ts(1)}'),
+      ('n2', 'workflow-a', 'r2', 'Alpha', 'alpha', 'opened', 300, 0, '${ts(1)}'),
+      ('n3', 'workflow-a', 'r3', 'Alpha', 'alpha', 'ignored', NULL, 0, '${ts(1)}'),
+      ('n4', 'workflow-a', 'r4', 'Alpha', 'alpha', 'ignored', NULL, 0, '${ts(1)}'),
+      ('n5', 'workflow-b', 'r5', 'Alpha', 'alpha', 'failed_open', NULL, 0, '${ts(1)}'),
+      ('n6', 'workflow-c', 'r6', 'Alpha', 'alpha', 'unknown', NULL, 0, '${ts(1)}'),
+      ('n7', 'workflow-g', 'r7', 'Gamma', 'gamma', 'opened', 500, 0, '${ts(40)}'),
+      ('n8', 'workflow-pending', 'r8', 'Alpha', 'alpha', 'nudged', NULL, 0, '${ts(0)}'),
+      (NULL, 'legacy', NULL, 'Alpha', 'alpha', NULL, NULL, 0, '${ts(1)}');
+  `);
+  db.close();
+
+  const { stdout } = await execFileAsync(process.execPath, [
+    resolve("evaluate-nudge-health.mjs"),
+    "--db-path", dbPath,
+    "--days", "90",
+    "--min-nudges", "3",
+    "--poor-rate", "0.6",
+    "--json",
+  ], { cwd: resolve(new URL("..", import.meta.url).pathname) });
+
+  const report = JSON.parse(stdout);
+  assert.equal(report.schema, "funnel-v2");
+  assert.equal(report.historical_unclassified_count, 1);
+  assert.deepEqual(report.summary, {
+    nudges: 8,
+    pending: 1,
+    settled: 7,
+    opened: 3,
+    ignored: 2,
+    failed_open: 1,
+    unknown: 1,
+    opened_rate: 3 / 7,
+    ignored_rate: 2 / 7,
+    median_open_ms: 300,
+  });
+  const alpha = report.skills.find((row) => row.skill_key === "alpha");
+  assert.equal(alpha.pending_count, 1);
+  assert.equal(alpha.settled_count, 6);
+  assert.equal(alpha.opened_rate, 2 / 6, "pending nudges must not lower settled conversion rates");
+  assert.equal(alpha.median_open_ms, 200);
+  assert.equal(alpha.resources_used_count, 2);
+  assert.equal(report.frequent_poor_conversion[0].skill_key, "alpha");
+  assert.equal(report.repeated_ignored[0].skill_key, "alpha");
+  assert.equal(report.repeated_ignored[0].workflow_hash.length, 12);
+  assert.deepEqual(report.zero_nudges[7].map((row) => row.skill_key), ["beta", "gamma"]);
+  assert.deepEqual(report.zero_nudges[30].map((row) => row.skill_key), ["beta", "gamma"]);
+  assert.deepEqual(report.zero_nudges[60].map((row) => row.skill_key), ["beta"]);
+  assert.deepEqual(report.zero_nudges[90].map((row) => row.skill_key), ["beta"]);
+
+  const { stdout: shortWindowStdout } = await execFileAsync(process.execPath, [
+    resolve("evaluate-nudge-health.mjs"),
+    "--db-path", dbPath,
+    "--days", "14",
+    "--json",
+  ], { cwd: resolve(new URL("..", import.meta.url).pathname) });
+  const shortWindow = JSON.parse(shortWindowStdout);
+  assert.deepEqual(shortWindow.zero_nudges[60].map((row) => row.skill_key), ["beta"], "zero-nudge windows must not be limited by the funnel window");
+});

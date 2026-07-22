@@ -16,6 +16,7 @@ const expectedHooks = [
   "session_end",
   "before_tool_call",
   "after_tool_call",
+  "agent_end",
   "message_received",
   "message_sent",
   "before_prompt_build",
@@ -65,7 +66,9 @@ async function runHook(hooks, name, event = {}, ctx = {}) {
 }
 
 async function main() {
-  const openClawCheckout = openClawCandidates.find((candidate) => existsSync(candidate));
+  const openClawCheckout = openClawCandidates.find((candidate) =>
+    existsSync(resolve(candidate, "dist", "plugin-sdk", "plugin-entry.js")),
+  );
   if (!openClawCheckout) {
     fail("OpenClaw checkout/package not found; set OPENCLAW_CHECKOUT or run npm install");
   }
@@ -89,7 +92,7 @@ async function main() {
     for (const file of ["package.json", "openclaw.plugin.json"]) {
       await copyFile(resolve(repoRoot, file), resolve(pluginRoot, file));
     }
-    for (const file of ["index.js", "skill-roots.mjs", "skill-router-helpers.mjs"]) {
+    for (const file of ["index.js", "skill-roots.mjs", "skill-router-helpers.mjs", "nudge-tracking.mjs"]) {
       await copyFile(resolve(repoRoot, "dist", file), resolve(pluginRoot, "dist", file));
     }
     await symlink(openClawCheckout, resolve(pluginRoot, "node_modules", "openclaw"));

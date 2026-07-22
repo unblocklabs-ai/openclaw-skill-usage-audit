@@ -16,7 +16,7 @@ Work from the repository root. Keep changes small, preserve generated/package mi
 - Use Node 24 for local validation and CI.
 - Run `npm test` for focused behavior checks.
 - Run `npm run preflight` before release or broad plugin/package changes.
-- `npm run preflight` is expected to run tests, entrypoint smoke checks, install-shape checks, marketplace sync checks, package dry-run, evaluator help checks, and inspector checks when available.
+- `npm run preflight` is expected to run Knip, tests, entrypoint smoke checks, install-shape checks, marketplace sync checks, package dry-run, evaluator help checks, and inspector checks when available.
 
 ## Marketplace Mirror
 

@@ -27,7 +27,6 @@
   "exports": {
     ".": "./dist/index.js"
   },
-  "dependencies": {},
   "optionalDependencies": {
     "better-sqlite3": ">=11.0.0"
   },

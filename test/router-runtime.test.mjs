@@ -76,14 +76,16 @@ test("plugin router hook nudges by skill key keywords and suppresses repeats", a
       const skillRoot = resolve(tempRoot, "skills");
       const skillDir = resolve(skillRoot, "keyed-router-skill");
       const pluginRoot = resolve(tempRoot, "plugin");
-      const openClawCheckout = openClawCandidates.find((candidate) => existsSync(candidate));
+      const openClawCheckout = openClawCandidates.find((candidate) =>
+        existsSync(resolve(candidate, "dist", "plugin-sdk", "plugin-entry.js")),
+      );
       const configPath = resolve(tempRoot, "openclaw.json");
       const dbPath = resolve(tempRoot, "audit.db");
       assert.ok(openClawCheckout, "OpenClaw checkout/package not found; set OPENCLAW_CHECKOUT or run npm install");
       await mkdir(skillDir, { recursive: true });
       await mkdir(workspaceDir, { recursive: true });
       await mkdir(resolve(pluginRoot, "node_modules"), { recursive: true });
-      for (const file of ["index.ts", "skill-roots.mjs", "skill-router-helpers.mjs", "package.json"]) {
+      for (const file of ["index.ts", "skill-roots.mjs", "skill-router-helpers.mjs", "nudge-tracking.mjs", "package.json"]) {
         await copyFile(resolve(repoRoot, file), resolve(pluginRoot, file));
       }
       await symlink(openClawCheckout, resolve(pluginRoot, "node_modules", "openclaw"));

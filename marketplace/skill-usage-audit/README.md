@@ -20,10 +20,11 @@ The runtime flow is:
 
 1. OpenClaw starts a session, tool call, message, or prompt-build lifecycle event.
 2. The plugin records canonical telemetry in `~/.openclaw/audits/skill-usage.db`.
-3. Skill reads are tracked as executions with surrounding context, version hashes, and implied outcomes.
+3. Successful skill reads are tracked as executions with surrounding context, version hashes, and implied outcomes.
 4. On `before_prompt_build`, the router loads all known skill roots and scores the configured task window against skill descriptions.
 5. If a skill clears the target threshold and was not recently suggested or read, the plugin injects a short `prependContext` nudge.
-6. Nudges and compact router decision traces are written to SQLite so you can evaluate effectiveness later.
+6. Each new nudge receives a stable nudge ID and is followed through tool and turn-completion hooks so it can be classified without guessing from a time-window join.
+7. Nudges and compact router decision traces are written to SQLite so you can evaluate effectiveness later.
 
 The router discovers skills from workspace roots, `.agents`, personal OpenClaw roots, bundled OpenClaw skills, configured extra directories, plugin skills, and Codex/OpenAI skill roots under `$CODEX_HOME` or `~/.codex`.
 
@@ -146,7 +147,7 @@ Advanced options:
 | `router.observability.enabled` | `true` | You want compact decision traces explaining why the router did or did not nudge. |
 | `router.observability.topCandidates` | `5` | You want more or fewer near-miss candidates stored per decision trace. |
 | `router.observability.retentionDays` | `30` | You want decision traces cleaned up after a different number of whole days; `0` disables cleanup. |
-| `router.observability.includeTaskExcerpt` | `false` | You want a redacted task excerpt in decision traces for local debugging. |
+| `router.observability.includeTaskExcerpt` | `false` | You want a redacted task excerpt in nudge and decision traces for local debugging. |
 | `router.overrides` | `[]` | Some workflows should always route to specific skills. |
 | `router.skillKeywords` | `{}` | A skill needs extra keyword boosts beyond its description. |
 | `router.blocklist` | `[]` | A skill should never be suggested by the router. |
@@ -174,6 +175,32 @@ The plugin includes guards to avoid noisy nudges:
 
 Decision tracing is compact by default. It stores skip/nudge reason, counts, selected skill keys, and bounded top candidates. It does not store raw task text unless `router.observability.includeTaskExcerpt` is enabled.
 
+## Nudge Funnel
+
+Funnel tracking is forward-looking. Each recommendation injected by the current runtime gets its own `nudge_id`, even when several skills are recommended in one run:
+
+- `nudged`: the recommendation was injected and the correlated turn is still active.
+- `opened`: a later successful tool call accessed that recommendation's exact resolved `SKILL.md`.
+- `failed_open`: an exact `SKILL.md` access was attempted but failed, with no later successful open.
+- `ignored`: a strongly correlated `agent_end` arrived without a qualifying successful or failed open.
+- `unknown`: identifiers or observable tool semantics were insufficient for a defensible classification, or only a session-level end was observed.
+- `resources_used`: after `opened`, a later successful call accessed a file beneath the same skill directory, including `references/`, `scripts/`, and `assets/`. The nudge row exposes the aggregate as `resources_used_count`.
+
+Successful structured read tools, recognized shell readers/executors, OpenClaw dynamic tools, and Codex-native calls relayed through OpenClaw's `before_tool_call`/`after_tool_call` hooks are supported. Paths are resolved lexically and through real paths, so quoted paths containing spaces and existing symlink aliases are handled. Matching is exact-path/descendant based; merely mentioning a skill path in output or an unrelated command is not an open.
+
+Funnel event inserts use deterministic keys based on nudge ID and tool-call ID, and SQLite writes are serialized in WAL mode. Duplicate hook delivery does not increment conversion or resource counts. Hook handlers queue serialized writes and never persist raw tool results.
+
+### Limitations
+
+- Codex-native shell, patch, and MCP observation requires an OpenClaw host that projects Codex native `PostToolUse` events into `after_tool_call` (confirmed in OpenClaw `2026.7.2-beta.3`). Older hosts may leave those runs `unknown`.
+- Arbitrary programs, shell expansion, and custom/MCP tools with opaque arguments cannot be proven to have read a file. Ambiguous relevant calls degrade the pending nudge to `unknown` instead of creating a substring-based false positive.
+- `session_end` has session identity but not a turn run ID. It closes unmatched pending nudges as `unknown`; only a correlated `agent_end` can prove `ignored`.
+- Existing nudge rows are intentionally not backfilled. Their new funnel columns remain `NULL`, and reports label them historical/unclassified.
+
+### Privacy
+
+Funnel event records contain only classification metadata: nudge/run/session identifiers, skill identity and resolved path, tool name/call ID, access path, timestamps, success, latency, coverage, and compact reason labels. They do not store prompts, shell output, tool results, or error bodies. The portfolio report hashes workflow/session identifiers before displaying repeated ignored workflows. New nudge and router decision task excerpts are both disabled by default and become bounded/scrubbed only when `router.observability.includeTaskExcerpt` is enabled. Historical excerpts are not rewritten.
+
 ## Evaluators
 
 Skill health:
@@ -190,13 +217,18 @@ node evaluate-nudge-health.mjs --help
 node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 14
 node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 14 --json
 node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 7 --decisions
+node evaluate-nudge-health.mjs --db-path ~/.openclaw/audits/skill-usage.db --days 90 --min-nudges 3 --poor-rate 0.25
 ```
+
+The default funnel report includes pending and settled nudges plus opened/ignored/failed/unknown outcomes by skill, settled-outcome open and ignore rates, median time to first open, resource-use counts, known skills with zero nudges in 7/30/60/90 days, frequent low-conversion recommendations, and repeated ignored recommendations within the same hashed workflow/session. Active `nudged` rows are reported as pending and do not lower conversion rates or trigger low-conversion alerts. `--json` exposes the same queries for a future weekly portfolio job.
 
 ## Database Tables
 
 - `skill_events` records raw lifecycle events.
 - `skill_executions` aggregates skill-read executions with context and implied outcome.
-- `skill_nudges` records emitted router nudges.
+- `skill_nudges` records emitted router nudges and their current forward-looking classification. Additive v2 columns remain `NULL` for historical rows.
+- `skill_nudge_events` is the append-only, idempotent attempt/open/resource event ledger.
+- `skill_router_catalog` records skills observed during router discovery so zero-nudge windows have a known denominator.
 - `skill_router_decisions` records compact skip/nudge traces.
 - `skills` stores per-skill rollups.
 - `skill_versions` stores content-based version hashes.
@@ -211,19 +243,28 @@ Run focused tests:
 npm test
 ```
 
+Run dead-code, unused-file, dependency, export, and type analysis:
+
+```bash
+npm run knip
+```
+
 Run the local preflight:
 
 ```bash
 npm run preflight
 ```
 
-The preflight runs tests, the OpenClaw entrypoint smoke check, install-shape checks, marketplace sync checks, package dry-run, evaluator help checks, and the optional plugin-inspector check. Set `OPENCLAW_CHECKOUT=/path/to/openclaw` to force compatibility checks against a specific checkout. The inspector step is skipped when `@openclaw/plugin-inspector` is not installed unless `CHECK_INSPECTOR_REQUIRE=1` is set.
+The preflight runs Knip, tests, the OpenClaw entrypoint smoke check, install-shape checks, marketplace sync checks, package dry-run, evaluator help checks, and the optional plugin-inspector check. The GitHub `Check` workflow runs this same preflight on pull requests and pushes to `main`, so Knip findings fail both CI and local review gates. Set `OPENCLAW_CHECKOUT=/path/to/openclaw` to force compatibility checks against a specific checkout. The inspector step is skipped when `@openclaw/plugin-inspector` is not installed unless `CHECK_INSPECTOR_REQUIRE=1` is set.
+
+`npm run typecheck` runs the strict source check independently of the emitting build.
 
 ## Repository Layout
 
 - `index.ts` is the TypeScript source for the compiled `dist/index.js` runtime entrypoint.
 - `skill-roots.mjs` discovers OpenClaw, Codex/OpenAI, workspace, and configured skill roots.
 - `skill-router-helpers.mjs` contains shared skill identity, routing config, and text-window helpers.
+- `nudge-tracking.mjs` contains conservative structured/shell path extraction, path identity, and duplicate-event helpers.
 - `evaluate-skill-health.mjs` computes skill health metrics from SQLite.
 - `evaluate-nudge-health.mjs` measures router nudge conversion and decision reasons.
 - `scripts/` contains package, marketplace, inspector, and release checks.

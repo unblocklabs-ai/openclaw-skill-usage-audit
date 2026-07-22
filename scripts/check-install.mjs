@@ -9,6 +9,7 @@ const RUNTIME_FILES = [
   "dist/index.js",
   "dist/skill-roots.mjs",
   "dist/skill-router-helpers.mjs",
+  "dist/nudge-tracking.mjs",
   "evaluate-skill-health.mjs",
   "evaluate-nudge-health.mjs",
 ];

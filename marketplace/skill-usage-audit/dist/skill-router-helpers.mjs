@@ -95,13 +95,13 @@ export function canonicalSkillId(candidate) {
   return String(candidate?.key || candidate?.name || "").trim().toLowerCase();
 }
 
-export function skillAliases(candidate) {
+function skillAliases(candidate) {
   return [candidate?.key, candidate?.name]
     .map((entry) => String(entry || "").trim().toLowerCase())
     .filter(Boolean);
 }
 
-export function buildNormalizedSkillEntryMap(entries) {
+function buildNormalizedSkillEntryMap(entries) {
   const out = new Map();
   if (!entries || typeof entries !== "object" || Array.isArray(entries)) return out;
 
@@ -170,7 +170,7 @@ export function resolveAgentSkillAllowlist(config, agentId) {
   return undefined;
 }
 
-export function resolveDefaultAgentId(config) {
+function resolveDefaultAgentId(config) {
   const agents = config?.agents;
   const direct =
     toStringLike(agents?.defaultAgentId) ||

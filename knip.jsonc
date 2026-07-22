@@ -1,0 +1,25 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "index.ts",
+    "evaluate-*.mjs",
+    "scripts/*.mjs",
+    "test/*.test.mjs"
+  ],
+  "project": [
+    "index.ts",
+    "*.mjs",
+    "scripts/*.mjs",
+    "test/*.mjs"
+  ],
+  "ignore": [
+    // Build outputs and the sync-checked marketplace package are generated from root sources.
+    "dist/**",
+    "marketplace/**",
+    "reports/**"
+  ],
+  "ignoreDependencies": [
+    // scripts/check-inspector.mjs resolves this package's binary through node_modules/.bin.
+    "@openclaw/plugin-inspector"
+  ]
+}

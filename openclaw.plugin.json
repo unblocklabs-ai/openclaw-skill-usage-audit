@@ -246,7 +246,7 @@
               "includeTaskExcerpt": {
                 "type": "boolean",
                 "default": false,
-                "description": "Store a redacted task excerpt in decision traces. Disabled by default for privacy."
+                "description": "Store a redacted task excerpt in nudge and decision traces. Disabled by default for privacy."
               }
             },
             "default": {

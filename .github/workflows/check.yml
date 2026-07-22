@@ -23,8 +23,9 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci --omit=optional
-      - run: npm run preflight
+      - run: npm ci
+      - name: Run preflight (includes Knip)
+        run: npm run preflight
       - uses: actions/upload-artifact@v7
         if: always()
         with:

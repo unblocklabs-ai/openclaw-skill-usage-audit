@@ -3,11 +3,12 @@
  */
 
 import { mkdir, readdir, readFile, stat } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { dirname, basename, resolve, join, relative, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
@@ -32,6 +33,13 @@ import {
   resolveCodexHome,
   resolveHomePath as resolveConfigHomePath,
 } from "./skill-roots.mjs";
+import {
+  classifyAccessForSkill,
+  extractToolAccesses,
+  isToolCallFailure,
+  resolvePathIdentity,
+  stableToolEventKey,
+} from "./nudge-tracking.mjs";
 
 
 const require = createRequire(import.meta.url);
@@ -283,6 +291,7 @@ interface SqliteBackend {
   kind: string;
   close: () => void;
   exec: (sql: string) => void;
+  transaction: <T>(fn: () => T) => T;
   prepare: (sql: string) => {
     run: (params?: Record<string, unknown>) => unknown;
     get: (params?: Record<string, unknown>) => Record<string, unknown> | undefined;
@@ -297,9 +306,35 @@ interface DbPrepared {
   insertExecution: (params: Record<string, unknown>) => void;
   insertFeedback: (params: Record<string, unknown>) => void;
   insertNudge: (params: Record<string, unknown>) => void;
+  insertNudgeEvent: (params: Record<string, unknown>) => void;
+  updateNudgeOutcome: (params: Record<string, unknown>) => void;
+  refreshNudgeResourceCount: (params: Record<string, unknown>) => void;
+  upsertSkillCatalog: (params: Record<string, unknown>) => void;
   insertRouterDecision: (params: Record<string, unknown>) => void;
   cleanupRouterDecisions: (params: Record<string, unknown>) => void;
   getRecentNudge: (params: Record<string, unknown>) => { id?: number } | undefined;
+}
+
+type NudgeOutcome = "nudged" | "opened" | "failed_open" | "ignored" | "unknown";
+type NudgeEventType = "open_attempt" | "opened" | "failed_open" | "resources_used" | "coverage_gap" | "ignored" | "unknown";
+
+interface PendingNudge {
+  nudgeId: string;
+  sessionId?: string;
+  sessionKey?: string;
+  runId?: string;
+  skillName: string;
+  skillKey: string;
+  skillPath: string;
+  skillRealPath?: string;
+  nudgedAt: string;
+  nudgedAtMs: number;
+  outcome: NudgeOutcome;
+  coverage: "strong" | "weak" | "insufficient";
+  classificationReason?: string;
+  resourceEventKeys: Set<string>;
+  seenToolEventKeys: Set<string>;
+  ended: boolean;
 }
 
 interface DbState {
@@ -309,7 +344,7 @@ interface DbState {
 }
 
 interface SharedShutdownParticipant {
-  flush: (reason: string) => void;
+  flush: (reason: string) => void | Promise<void>;
 }
 
 interface SkillUsageAuditGlobalState {
@@ -984,7 +1019,7 @@ async function collectSkillCandidatesFromRoot(root: string, source: string, grou
     return out;
   }
 
-  let entries: Awaited<ReturnType<typeof readdir>>;
+  let entries: Dirent<string>[];
   try {
     entries = await readdir(root, { withFileTypes: true });
   } catch {
@@ -999,7 +1034,7 @@ async function collectSkillCandidatesFromRoot(root: string, source: string, grou
     }
     if (remainingGroupDepth <= 0) return;
 
-    let childEntries: Awaited<ReturnType<typeof readdir>>;
+    let childEntries: Dirent<string>[];
     try {
       childEntries = await readdir(dirPath, { withFileTypes: true });
     } catch {
@@ -1052,7 +1087,7 @@ async function loadSkillCandidatesForWorkspace(
 ): Promise<SkillCandidateCache> {
   const now = Date.now();
   const config = await readOpenClawConfigSnapshot();
-  const bundleRoot = resolveBundledSkillsRoot({ moduleDir: __dirname });
+  const bundleRoot = resolveBundledSkillsRoot({ moduleDir: __dirname } as any);
   const cacheKey = routerDiscoveryCacheKey(workspaceDir, config, bundleRoot, discovery);
   const cached = workspaceSkillCache.get(cacheKey);
   if (cached && now - cached.fetchedAt < ROUTER_CACHE_TTL_MS) {
@@ -1064,7 +1099,7 @@ async function loadSkillCandidatesForWorkspace(
     bundledRoot: bundleRoot,
     includeBundled: Boolean(bundleRoot),
     discovery,
-  }) as Array<{ root: string; source: string }>;
+  } as any) as Array<{ root: string; source: string }>;
   const groupDepth = typeof discovery.groupDepth === "number" ? discovery.groupDepth : DEFAULT_ROUTER_DISCOVERY_GROUP_DEPTH;
 
   const seen = new Map<string, { priority: number; candidate: SkillCandidate }>();
@@ -1190,7 +1225,7 @@ function scoreSkill(
   return { score, reason: reason || "none" };
 }
 
-function formatNudge(skills: SkillCandidate[]): string {
+function formatNudge(skills: SkillCandidate[], nudgeIds: Map<string, string> = new Map()): string {
   const noun = skills.length === 1 ? "this skill" : "these skills";
   const lines = [
     `[skill-router] Based on your current task, you likely need ${noun}:`,
@@ -1200,6 +1235,8 @@ function formatNudge(skills: SkillCandidate[]): string {
     const desc = (skill.description || "").replace(/\s+/g, " ").trim();
     lines.push(`  → ${skill.name}: "${desc || "No description available."}"`);
     lines.push(`    [skill-router:id ${canonicalSkillId(skill)}]`);
+    const nudgeId = nudgeIds.get(canonicalSkillId(skill));
+    if (nudgeId) lines.push(`    [skill-router:nudge ${nudgeId}]`);
     lines.push(`    Location: ${normalizePathForDisplay(skill.filePath)}`);
     lines.push("    Read it with the read tool before proceeding.");
   }
@@ -1308,6 +1345,7 @@ function createPreparedStatements(db: SqliteBackend, log: { debug?: (msg: string
 
   const insertNudge = db.prepare(`
     INSERT INTO skill_nudges (
+      nudge_id,
       session_key,
       session_id,
       run_id,
@@ -1318,8 +1356,14 @@ function createPreparedStatements(db: SqliteBackend, log: { debug?: (msg: string
       score,
       match_reason,
       turn_number,
-      task_excerpt
+      task_excerpt,
+      outcome,
+      outcome_at,
+      coverage,
+      classification_reason,
+      skill_real_path
     ) VALUES (
+      @nudge_id,
       @session_key,
       @session_id,
       @run_id,
@@ -1330,8 +1374,94 @@ function createPreparedStatements(db: SqliteBackend, log: { debug?: (msg: string
       @score,
       @match_reason,
       @turn_number,
-      @task_excerpt
+      @task_excerpt,
+      @outcome,
+      @outcome_at,
+      @coverage,
+      @classification_reason,
+      @skill_real_path
     )
+    ON CONFLICT(nudge_id) DO NOTHING
+  `);
+
+  const insertNudgeEvent = db.prepare(`
+    INSERT OR IGNORE INTO skill_nudge_events (
+      event_key,
+      nudge_id,
+      event_type,
+      occurred_at,
+      run_id,
+      session_key,
+      tool_name,
+      tool_call_id,
+      access_path,
+      success,
+      classification_reason
+    ) VALUES (
+      @event_key,
+      @nudge_id,
+      @event_type,
+      @occurred_at,
+      @run_id,
+      @session_key,
+      @tool_name,
+      @tool_call_id,
+      @access_path,
+      @success,
+      @classification_reason
+    )
+  `);
+
+  const updateNudgeOutcome = db.prepare(`
+    UPDATE skill_nudges
+    SET
+      outcome = @outcome,
+      outcome_at = @outcome_at,
+      opened_at = CASE WHEN @outcome = 'opened' THEN COALESCE(opened_at, @outcome_at) ELSE opened_at END,
+      open_latency_ms = CASE WHEN @outcome = 'opened' THEN COALESCE(open_latency_ms, @open_latency_ms) ELSE open_latency_ms END,
+      coverage = @coverage,
+      classification_reason = @classification_reason,
+      open_tool_name = CASE WHEN @outcome = 'opened' THEN COALESCE(open_tool_name, @tool_name) ELSE open_tool_name END,
+      opened_path = CASE WHEN @outcome = 'opened' THEN COALESCE(opened_path, @access_path) ELSE opened_path END
+    WHERE nudge_id = @nudge_id
+      AND (
+        outcome IS NULL
+        OR outcome = 'nudged'
+        OR (outcome = 'failed_open' AND @outcome IN ('opened', 'unknown'))
+        OR (outcome = @outcome AND outcome <> 'opened')
+      )
+  `);
+
+  const refreshNudgeResourceCount = db.prepare(`
+    UPDATE skill_nudges
+    SET resources_used_count = (
+      SELECT COUNT(*)
+      FROM skill_nudge_events e
+      WHERE e.nudge_id = @nudge_id AND e.event_type = 'resources_used'
+    )
+    WHERE nudge_id = @nudge_id
+  `);
+
+  const upsertSkillCatalog = db.prepare(`
+    INSERT INTO skill_router_catalog (
+      skill_key,
+      skill_name,
+      skill_path,
+      skill_source,
+      first_seen_at,
+      last_seen_at
+    ) VALUES (
+      @skill_key,
+      @skill_name,
+      @skill_path,
+      @skill_source,
+      @first_seen_at,
+      @last_seen_at
+    )
+    ON CONFLICT(skill_key, skill_path) DO UPDATE SET
+      skill_name = excluded.skill_name,
+      skill_source = excluded.skill_source,
+      last_seen_at = excluded.last_seen_at
   `);
 
   const insertRouterDecision = db.prepare(`
@@ -1444,11 +1574,15 @@ function createPreparedStatements(db: SqliteBackend, log: { debug?: (msg: string
     getLatestSkillVersion: (params) => getLatestSkillVersion.get(params) as { version_hash?: string } | undefined,
     insertExecution: (params) => insertExecution.run(params),
     insertFeedback: (params) => insertFeedback.run(params),
-    insertNudge: (params) => {
+    insertNudge: (params) => insertNudge.run(params),
+    insertNudgeEvent: (params) => insertNudgeEvent.run(params),
+    updateNudgeOutcome: (params) => updateNudgeOutcome.run(params),
+    refreshNudgeResourceCount: (params) => refreshNudgeResourceCount.run(params),
+    upsertSkillCatalog: (params) => {
       try {
-        insertNudge.run(params);
+        upsertSkillCatalog.run(params);
       } catch (err) {
-        log.debug?.(`skill-usage-audit: insertNudge failed: ${String(err)}`);
+        log.debug?.(`skill-usage-audit: upsertSkillCatalog failed: ${String(err)}`);
       }
     },
     insertRouterDecision: (params) => {
@@ -1492,6 +1626,7 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
         kind: "better-sqlite3",
         close: () => db.close(),
         exec: (sql) => db.exec(sql),
+        transaction: <T>(fn: () => T) => db.transaction(fn)(),
         prepare: (sql) => {
           const stmt = db.prepare(sql);
           return {
@@ -1517,6 +1652,21 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
           kind: "node:sqlite",
           close: () => db.close(),
           exec: (sql) => db.exec(sql),
+          transaction: <T>(fn: () => T) => {
+            db.exec("BEGIN IMMEDIATE;");
+            try {
+              const result = fn();
+              db.exec("COMMIT;");
+              return result;
+            } catch (error) {
+              try {
+                db.exec("ROLLBACK;");
+              } catch {
+                // Preserve the original transaction error.
+              }
+              throw error;
+            }
+          },
           prepare: (sql) => {
             const stmt = db.prepare(sql);
             return {
@@ -1626,6 +1776,7 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
 
     CREATE TABLE IF NOT EXISTS skill_nudges (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nudge_id TEXT,
       session_key TEXT,
       session_id TEXT,
       run_id TEXT,
@@ -1637,7 +1788,44 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
       match_reason TEXT,
       turn_number INTEGER,
       task_excerpt TEXT,
+      outcome TEXT,
+      outcome_at TEXT,
+      opened_at TEXT,
+      open_latency_ms INTEGER,
+      resources_used_count INTEGER DEFAULT 0,
+      coverage TEXT,
+      classification_reason TEXT,
+      open_tool_name TEXT,
+      opened_path TEXT,
+      skill_real_path TEXT,
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS skill_nudge_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_key TEXT NOT NULL UNIQUE,
+      nudge_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      run_id TEXT,
+      session_key TEXT,
+      tool_name TEXT,
+      tool_call_id TEXT,
+      access_path TEXT,
+      success INTEGER,
+      classification_reason TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS skill_router_catalog (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      skill_key TEXT NOT NULL,
+      skill_name TEXT NOT NULL,
+      skill_path TEXT NOT NULL,
+      skill_source TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      UNIQUE(skill_key, skill_path)
     );
 
     CREATE TABLE IF NOT EXISTS skill_router_decisions (
@@ -1673,6 +1861,9 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
     CREATE INDEX IF NOT EXISTS idx_router_decisions_reason ON skill_router_decisions(reason);
     CREATE INDEX IF NOT EXISTS idx_router_decisions_run ON skill_router_decisions(run_id);
     CREATE INDEX IF NOT EXISTS idx_router_decisions_session ON skill_router_decisions(session_key);
+    CREATE INDEX IF NOT EXISTS idx_nudge_events_nudge ON skill_nudge_events(nudge_id);
+    CREATE INDEX IF NOT EXISTS idx_nudge_events_type ON skill_nudge_events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_skill_catalog_key ON skill_router_catalog(skill_key);
   `);
 
   try {
@@ -1685,9 +1876,35 @@ async function initSqlite(path: string, log: { debug?: (msg: string) => void; in
   } catch {
     // Existing databases may already have the column.
   }
+  const nudgeMigrationColumns = [
+    ["nudge_id", "TEXT"],
+    ["outcome", "TEXT"],
+    ["outcome_at", "TEXT"],
+    ["opened_at", "TEXT"],
+    ["open_latency_ms", "INTEGER"],
+    ["resources_used_count", "INTEGER DEFAULT 0"],
+    ["coverage", "TEXT"],
+    ["classification_reason", "TEXT"],
+    ["open_tool_name", "TEXT"],
+    ["opened_path", "TEXT"],
+    ["skill_real_path", "TEXT"],
+  ] as const;
+  for (const [column, type] of nudgeMigrationColumns) {
+    try {
+      backend.exec(`ALTER TABLE skill_nudges ADD COLUMN ${column} ${type};`);
+    } catch {
+      // Additive migration: existing databases may already have the column.
+    }
+  }
   backend.exec(`
     CREATE INDEX IF NOT EXISTS idx_nudges_run ON skill_nudges(run_id);
     CREATE INDEX IF NOT EXISTS idx_nudges_skill_key ON skill_nudges(skill_key);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_nudges_nudge_id ON skill_nudges(nudge_id);
+    CREATE INDEX IF NOT EXISTS idx_nudges_outcome ON skill_nudges(outcome);
+    CREATE INDEX IF NOT EXISTS idx_nudge_events_nudge ON skill_nudge_events(nudge_id);
+    CREATE INDEX IF NOT EXISTS idx_nudge_events_type ON skill_nudge_events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_skill_catalog_key ON skill_router_catalog(skill_key);
+    PRAGMA user_version = 2;
   `);
 
   const statements = createPreparedStatements(backend, log);
@@ -1848,6 +2065,8 @@ export default definePluginEntry({
     const execByScope = new Map<string, SkillExecutionState[]>();
     const execByTool = new Map<string, number>();
     let executionSeq = 0;
+    const pendingNudges = new Map<string, PendingNudge>();
+    let nudgeObservationChain = Promise.resolve<void>(undefined);
 
     const EXECUTION_STALE_MS = 10 * 60 * 1000; // 10 minutes
     const EXECUTION_CLEANUP_EVERY = 50;
@@ -1938,7 +2157,7 @@ export default definePluginEntry({
             : typeof rowType.success === "number" && Number.isFinite(rowType.success)
               ? (rowType.success ? 1 : 0)
               : null,
-        error: toStringLike(rowType.error) || null,
+        error: toStringLike(rowType.error) ? sanitizeValue(rowType.error, 400, piiEnabled) : null,
         skill_name: toStringLike(rowType.skillName) || null,
         skill_path: toStringLike(rowType.skillPath) || null,
         skill_source: toStringLike(rowType.skillSource) || null,
@@ -1984,6 +2203,7 @@ export default definePluginEntry({
   }
 
   function queueNudgeInsert(params: {
+    nudgeId: string;
     event: RawEvent;
     ctx: RawContext | undefined;
     skillName: string;
@@ -1992,7 +2212,11 @@ export default definePluginEntry({
     score: number;
     matchReason: string;
     turnNumber: number | null;
-    taskExcerpt: string;
+    taskExcerpt: string | null;
+    outcome: NudgeOutcome;
+    coverage: PendingNudge["coverage"];
+    classificationReason?: string;
+    skillRealPath?: string;
   }): void {
     scheduleDbWrite("failed writing nudge", true, async () => {
       const state = await ensureDbReady();
@@ -2000,6 +2224,7 @@ export default definePluginEntry({
 
       const base = buildBase(params.event as { sessionId?: string; runId?: string }, params.ctx);
       state.statements.insertNudge({
+        nudge_id: params.nudgeId,
         session_key: base.sessionKey || null,
         session_id: base.sessionId || null,
         run_id: base.runId || null,
@@ -2011,7 +2236,170 @@ export default definePluginEntry({
         match_reason: params.matchReason,
         turn_number: params.turnNumber,
         task_excerpt: params.taskExcerpt,
+        outcome: params.outcome,
+        outcome_at: params.outcome === "unknown" ? new Date().toISOString() : null,
+        coverage: params.coverage,
+        classification_reason: params.classificationReason || null,
+        skill_real_path: params.skillRealPath || null,
       });
+    });
+  }
+
+  function queueSkillCatalogUpserts(candidates: SkillCandidate[]): void {
+    if (!candidates.length) return;
+    const seenAt = new Date().toISOString();
+    scheduleDbWrite("failed writing skill router catalog", false, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
+      for (const candidate of candidates) {
+        state.statements.upsertSkillCatalog({
+          skill_key: canonicalSkillId(candidate),
+          skill_name: candidate.name,
+          skill_path: candidate.filePath,
+          skill_source: candidate.source,
+          first_seen_at: seenAt,
+          last_seen_at: seenAt,
+        });
+      }
+    });
+  }
+
+  function queueNudgeEvent(params: {
+    nudge: PendingNudge;
+    eventKey: string;
+    eventType: NudgeEventType;
+    occurredAt: string;
+    toolName?: string;
+    toolCallId?: string;
+    accessPath?: string;
+    success?: boolean;
+    classificationReason?: string;
+  }): void {
+    scheduleDbWrite("failed writing nudge event", true, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
+      state.backend?.transaction(() => {
+        state.statements?.insertNudgeEvent({
+          event_key: params.eventKey,
+          nudge_id: params.nudge.nudgeId,
+          event_type: params.eventType,
+          occurred_at: params.occurredAt,
+          run_id: params.nudge.runId || null,
+          session_key: params.nudge.sessionKey || null,
+          tool_name: params.toolName || null,
+          tool_call_id: params.toolCallId || null,
+          access_path: params.accessPath || null,
+          success: params.success === undefined ? null : params.success ? 1 : 0,
+          classification_reason: params.classificationReason || null,
+        });
+        if (params.eventType === "resources_used") {
+          state.statements?.refreshNudgeResourceCount({ nudge_id: params.nudge.nudgeId });
+        }
+      });
+    });
+  }
+
+  function queueNudgeOutcomeUpdate(
+    nudge: PendingNudge,
+    outcome: NudgeOutcome,
+    reason: string,
+    occurredAt = new Date().toISOString(),
+    details: {
+      toolName?: string;
+      toolCallId?: string;
+      accessPath?: string;
+      eventKey?: string;
+      eventType?: NudgeEventType;
+      success?: boolean;
+    } = {},
+  ): void {
+    if (nudge.outcome === "opened") return;
+    if (nudge.ended && nudge.outcome === outcome) return;
+    const previousOutcome = nudge.outcome;
+    nudge.outcome = outcome;
+    nudge.classificationReason = reason;
+    const occurredMs = Date.parse(occurredAt);
+    const latencyMs = outcome === "opened" && Number.isFinite(occurredMs)
+      ? Math.max(0, occurredMs - nudge.nudgedAtMs)
+      : null;
+    scheduleDbWrite("failed updating nudge outcome", true, async () => {
+      const state = await ensureDbReady();
+      if (!state.statements) return;
+      try {
+        state.backend?.transaction(() => {
+          if (details.eventKey && details.eventType) {
+            state.statements?.insertNudgeEvent({
+              event_key: details.eventKey,
+              nudge_id: nudge.nudgeId,
+              event_type: details.eventType,
+              occurred_at: occurredAt,
+              run_id: nudge.runId || null,
+              session_key: nudge.sessionKey || null,
+              tool_name: details.toolName || null,
+              tool_call_id: details.toolCallId || null,
+              access_path: details.accessPath || null,
+              success: details.success === undefined ? null : details.success ? 1 : 0,
+              classification_reason: reason,
+            });
+          }
+          state.statements?.updateNudgeOutcome({
+            nudge_id: nudge.nudgeId,
+            outcome,
+            outcome_at: occurredAt,
+            open_latency_ms: latencyMs,
+            coverage: nudge.coverage,
+            classification_reason: reason,
+            tool_name: details.toolName || null,
+            access_path: details.accessPath || null,
+          });
+        });
+      } catch (error) {
+        nudge.coverage = "insufficient";
+        nudge.classificationReason = "persistence_failed";
+        try {
+          state.backend?.transaction(() => {
+            state.statements?.insertNudgeEvent({
+              event_key: `${nudge.nudgeId}\0persistence_failure\0unknown`,
+              nudge_id: nudge.nudgeId,
+              event_type: "unknown",
+              occurred_at: occurredAt,
+              run_id: nudge.runId || null,
+              session_key: nudge.sessionKey || null,
+              tool_name: details.toolName || null,
+              tool_call_id: details.toolCallId || null,
+              access_path: details.accessPath || null,
+              success: null,
+              classification_reason: "persistence_failed",
+            });
+            state.statements?.updateNudgeOutcome({
+              nudge_id: nudge.nudgeId,
+              outcome: "unknown",
+              outcome_at: occurredAt,
+              open_latency_ms: null,
+              coverage: "insufficient",
+              classification_reason: "persistence_failed",
+              tool_name: null,
+              access_path: null,
+            });
+          });
+          nudge.outcome = "unknown";
+        } catch (recoveryError) {
+          if (nudge.outcome === outcome) nudge.outcome = previousOutcome;
+          throw new Error(`${String(error)}; recovery failed: ${String(recoveryError)}`, { cause: error });
+        }
+        throw error;
+      }
+    });
+  }
+
+  function correlatedPendingNudges(event: RawEvent, ctx: RawContext | undefined): PendingNudge[] {
+    const base = buildBase(event as { sessionId?: string; runId?: string }, ctx);
+    return [...pendingNudges.values()].filter((nudge) => {
+      if (nudge.ended) return false;
+      if (nudge.runId && base.runId) return nudge.runId === base.runId;
+      if (nudge.runId || base.runId) return false;
+      if (nudge.sessionKey && base.sessionKey) return nudge.sessionKey === base.sessionKey;
+      return Boolean(nudge.sessionId && base.sessionId && nudge.sessionId === base.sessionId);
     });
   }
 
@@ -2424,12 +2812,12 @@ export default definePluginEntry({
     const toolName = toStringLike(event.toolName) || "";
     if (toolName === "read" && typeof event.params === "object" && event.error) {
       target.mechanicalSuccess = false;
-      target.error = target.error || toStringLike(event.error) || "tool failure";
+      target.error = target.error || sanitizeValue(event.error, 400, piiEnabled) || "tool failure";
     }
 
     if (event.error) {
       target.mechanicalSuccess = false;
-      target.error = target.error || toStringLike(event.error) || "tool failure";
+      target.error = target.error || sanitizeValue(event.error, 400, piiEnabled) || "tool failure";
     }
 
     return target;
@@ -2588,6 +2976,187 @@ export default definePluginEntry({
     return execution;
   }
 
+  async function observeNudgeToolCall(event: RawEvent, ctx: RawContext | undefined, occurredAt: string): Promise<void> {
+    const nudges = correlatedPendingNudges(event, ctx);
+    if (!nudges.length) return;
+
+    const toolName = toStringLike(event.toolName) || "";
+    const toolCallId = toStringLike(event.toolCallId);
+    const params = event.params && typeof event.params === "object" && !Array.isArray(event.params)
+      ? event.params as Record<string, unknown>
+      : {};
+    const failure = isToolCallFailure(event);
+    const extracted = extractToolAccesses(toolName, params, toStringLike(ctx?.workspaceDir));
+
+    for (const nudge of nudges) {
+      const wasOpenedBeforeCall = nudge.outcome === "opened";
+      if (!toolCallId) {
+        nudge.coverage = "insufficient";
+        nudge.classificationReason = "tool_call_id_missing";
+        continue;
+      }
+
+      const deliveryKey = `${toolCallId}\0${toolName}`;
+      if (nudge.seenToolEventKeys.has(deliveryKey)) continue;
+      nudge.seenToolEventKeys.add(deliveryKey);
+
+      let matched = false;
+      for (const access of extracted.accesses) {
+        const accessKind = await classifyAccessForSkill(
+          access.path,
+          nudge.skillPath,
+          nudge.skillRealPath,
+          access.cwd || toStringLike(ctx?.workspaceDir),
+        );
+        if (!accessKind) continue;
+        matched = true;
+
+        if (accessKind === "skill") {
+          const attemptKey = stableToolEventKey({
+            nudgeId: nudge.nudgeId,
+            toolCallId,
+            toolName,
+            eventType: "open_attempt",
+            accessPath: access.path,
+          });
+          if (attemptKey) {
+            queueNudgeEvent({
+              nudge,
+              eventKey: attemptKey,
+              eventType: "open_attempt",
+              occurredAt,
+              toolName,
+              toolCallId,
+              accessPath: access.path,
+              success: !failure,
+              classificationReason: access.kind === "execute" ? "recognized_shell_execution" : "exact_skill_path",
+            });
+          }
+
+          const terminalType = failure ? "failed_open" : "opened";
+          const terminalKey = stableToolEventKey({
+            nudgeId: nudge.nudgeId,
+            toolCallId,
+            toolName,
+            eventType: terminalType,
+            accessPath: access.path,
+          });
+
+          if (failure) {
+            if (nudge.outcome !== "opened") {
+              queueNudgeOutcomeUpdate(nudge, "failed_open", "exact_skill_read_failed", occurredAt, {
+                toolName,
+                toolCallId,
+                accessPath: access.path,
+                eventKey: terminalKey,
+                eventType: terminalType,
+                success: false,
+              });
+            }
+          } else {
+            queueNudgeOutcomeUpdate(nudge, "opened", "exact_skill_read_succeeded", occurredAt, {
+              toolName,
+              toolCallId,
+              accessPath: access.path,
+              eventKey: terminalKey,
+              eventType: terminalType,
+              success: true,
+            });
+          }
+          continue;
+        }
+
+        if (accessKind === "resource" && !failure && wasOpenedBeforeCall) {
+          const resourceKey = stableToolEventKey({
+            nudgeId: nudge.nudgeId,
+            toolCallId,
+            toolName,
+            eventType: "resources_used",
+            accessPath: access.path,
+          });
+          if (resourceKey && !nudge.resourceEventKeys.has(resourceKey)) {
+            nudge.resourceEventKeys.add(resourceKey);
+            queueNudgeEvent({
+              nudge,
+              eventKey: resourceKey,
+              eventType: "resources_used",
+              occurredAt,
+              toolName,
+              toolCallId,
+              accessPath: access.path,
+              success: true,
+              classificationReason: "skill_descendant_accessed_after_open",
+            });
+          }
+        }
+      }
+
+      if (extracted.ambiguous && !matched && nudge.outcome !== "opened") {
+        nudge.coverage = "insufficient";
+        nudge.classificationReason = "ambiguous_tool_access";
+        const gapKey = stableToolEventKey({
+          nudgeId: nudge.nudgeId,
+          toolCallId,
+          toolName,
+          eventType: "coverage_gap",
+          accessPath: "",
+        });
+        if (gapKey) {
+          queueNudgeEvent({
+            nudge,
+            eventKey: gapKey,
+            eventType: "coverage_gap",
+            occurredAt,
+            toolName,
+            toolCallId,
+            classificationReason: "ambiguous_tool_access",
+          });
+        }
+      }
+    }
+  }
+
+  function finishNudgesForAgentEnd(event: RawEvent, ctx: RawContext | undefined): void {
+    const nudges = correlatedPendingNudges(event, ctx);
+    for (const nudge of nudges) {
+      if (nudge.outcome === "nudged") {
+        if (nudge.coverage !== "strong") {
+          queueNudgeOutcomeUpdate(nudge, "unknown", nudge.classificationReason || "coverage_insufficient", undefined, {
+            eventKey: `${nudge.nudgeId}\0agent_end\0unknown`,
+            eventType: "unknown",
+          });
+        } else {
+          queueNudgeOutcomeUpdate(nudge, "ignored", "agent_end_without_qualifying_read", undefined, {
+            eventKey: `${nudge.nudgeId}\0agent_end\0ignored`,
+            eventType: "ignored",
+          });
+        }
+      }
+      nudge.ended = true;
+      pendingNudges.delete(nudge.nudgeId);
+    }
+  }
+
+  function finishNudgesForSessionEnd(event: RawEvent, ctx: RawContext | undefined): void {
+    const base = buildBase(event as { sessionId?: string; runId?: string }, ctx);
+    for (const nudge of [...pendingNudges.values()]) {
+      const sameSession = Boolean(
+        (nudge.sessionKey && base.sessionKey && nudge.sessionKey === base.sessionKey)
+        || (nudge.sessionId && base.sessionId && nudge.sessionId === base.sessionId),
+      );
+      if (!sameSession) continue;
+      if (nudge.outcome === "nudged") {
+        nudge.coverage = "insufficient";
+        queueNudgeOutcomeUpdate(nudge, "unknown", "session_end_without_correlated_agent_end", undefined, {
+          eventKey: `${nudge.nudgeId}\0session_end\0unknown`,
+          eventType: "unknown",
+        });
+      }
+      nudge.ended = true;
+      pendingNudges.delete(nudge.nudgeId);
+    }
+  }
+
   interface ParsedSkillBlock {
     name: string;
     location?: string;
@@ -2707,6 +3276,7 @@ export default definePluginEntry({
     const configuredWorkspaceDir = toStringLike(ctx?.workspaceDir);
     const workspaceDir = configuredWorkspaceDir && configuredWorkspaceDir.trim().length > 0 ? configuredWorkspaceDir : pluginWorkspaceDir;
     const skillCache = await loadSkillCandidatesForWorkspace(workspaceDir, routerDiscovery);
+    queueSkillCatalogUpserts(skillCache.candidates);
     const config = await readOpenClawConfigSnapshot();
     const effectiveAgentId = resolveEffectiveAgentId(config, ctx, event, isRegularAgent);
     const agentAllowlist = resolveAgentSkillAllowlist(config, effectiveAgentId);
@@ -2847,12 +3417,46 @@ export default definePluginEntry({
       return;
     }
 
-    const taskExcerpt = sanitizeValue(scrubSecrets(taskText, piiEnabled), 200, piiEnabled);
+    const taskExcerpt = routerObservabilityIncludeTaskExcerpt
+      ? sanitizeValue(scrubSecrets(taskText, piiEnabled), 200, piiEnabled)
+      : null;
+    const nudgeIds = new Map<string, string>();
     for (const skill of selected) {
       const isOverride = hasOverride.some((entry) => canonicalSkillId(entry) === canonicalSkillId(skill));
       const row = isOverride ? { score: 0, reason: "override" } : scoreSkill(taskText, skill, routerSkillKeywords, idf, avgDescLen);
 
+      const base = buildBase(event as { sessionId?: string; runId?: string }, ctx);
+      const nudgeId = randomUUID();
+      const pathIdentity = await resolvePathIdentity(skill.filePath, workspaceDir);
+      const hasStrongCorrelation = Boolean(base.runId);
+      const hasWeakCorrelation = Boolean(base.sessionKey || base.sessionId);
+      const coverage: PendingNudge["coverage"] = hasStrongCorrelation ? "strong" : hasWeakCorrelation ? "weak" : "insufficient";
+      const initialOutcome: NudgeOutcome = hasWeakCorrelation || hasStrongCorrelation ? "nudged" : "unknown";
+      const classificationReason = initialOutcome === "unknown" ? "nudge_identifiers_missing" : undefined;
+      const nudgedAt = new Date().toISOString();
+      const pending: PendingNudge = {
+        nudgeId,
+        sessionId: base.sessionId,
+        sessionKey: base.sessionKey,
+        runId: base.runId,
+        skillName: skill.name,
+        skillKey: canonicalSkillId(skill),
+        skillPath: pathIdentity?.lexicalPath || skill.filePath,
+        skillRealPath: pathIdentity?.realPath,
+        nudgedAt,
+        nudgedAtMs: Date.parse(nudgedAt),
+        outcome: initialOutcome,
+        coverage,
+        classificationReason,
+        resourceEventKeys: new Set(),
+        seenToolEventKeys: new Set(),
+        ended: initialOutcome === "unknown",
+      };
+      nudgeIds.set(canonicalSkillId(skill), nudgeId);
+      if (!pending.ended) pendingNudges.set(nudgeId, pending);
+
       queueNudgeInsert({
+        nudgeId,
         event,
         ctx,
         skillName: skill.name,
@@ -2862,6 +3466,10 @@ export default definePluginEntry({
         matchReason: row.reason,
         turnNumber,
         taskExcerpt,
+        outcome: initialOutcome,
+        coverage,
+        classificationReason,
+        skillRealPath: pathIdentity?.realPath,
       });
       rememberRouterNudge(nudgeScope, skill, turnNumber);
     }
@@ -2888,7 +3496,7 @@ export default definePluginEntry({
       topCandidates,
     });
 
-    return { prependContext: formatNudge(selected) };
+    return { prependContext: formatNudge(selected, nudgeIds) };
   }
 
 
@@ -2902,6 +3510,8 @@ export default definePluginEntry({
   });
 
   api.on("session_end", async (event, ctx: RawContext) => {
+    await nudgeObservationChain;
+    finishNudgesForSessionEnd(event as RawEvent, ctx);
     const keys = buildScopeKeys(ctx, event);
     const remaining = candidatesForScope(keys);
     for (const execution of remaining) {
@@ -2934,15 +3544,8 @@ export default definePluginEntry({
     });
 
     const scopeKeys = buildScopeKeys(ctx, event);
-    const skillPath = extractSkillPathFromParams(params);
-
-    if (toolName === "read" && skillPath) {
-      const execution = startExecutionFromSkillRead(ctx, event as RawEvent, skillPath, now);
-      attachToolCall(scopeKeys, event as RawEvent, execution);
-      return;
-    }
-
-    attachToolCall(scopeKeys, event as RawEvent);
+    const isSkillRead = toolName === "read" && extractSkillPathFromParams(params) !== undefined;
+    if (!isSkillRead) attachToolCall(scopeKeys, event as RawEvent);
   });
 
   api.on("after_tool_call", async (event, ctx: RawContext) => {
@@ -2950,7 +3553,20 @@ export default definePluginEntry({
     const toolName = toStringLike((event as RawEvent).toolName) || "";
     const params = ((event as RawEvent).params as Record<string, unknown>) || {};
     const scopeKeys = buildScopeKeys(ctx, event);
-    const linked = detachToolCall(event as RawEvent, scopeKeys);
+    let linked = detachToolCall(event as RawEvent, scopeKeys);
+    const failed = isToolCallFailure(event as RawEvent);
+    const skillPath = extractSkillPathFromParams(params);
+    if (!failed && toolName === "read" && skillPath) {
+      const execution = startExecutionFromSkillRead(ctx, event as RawEvent, skillPath, now);
+      attachToolCall(scopeKeys, event as RawEvent, execution);
+      linked = detachToolCall(event as RawEvent, scopeKeys) || execution;
+    }
+    nudgeObservationChain = nudgeObservationChain
+      .then(() => observeNudgeToolCall(event as RawEvent, ctx, now))
+      .catch((error) => {
+        log.error(`skill-usage-audit: nudge observation failed: ${String(error)}`);
+      });
+    await nudgeObservationChain;
 
     enqueueEvent({
       v: 1,
@@ -2961,11 +3577,16 @@ export default definePluginEntry({
       toolCallId: toStringLike((event as RawEvent).toolCallId),
       params: includeToolParams ? buildToolParams(toolName, params, redactKeys, piiEnabled) : undefined,
       durationMs: typeof (event as RawEvent).durationMs === "number" ? Number((event as RawEvent).durationMs) : undefined,
-      success: (event as RawEvent).error ? 0 : 1,
+      success: failed ? 0 : 1,
       error: toStringLike((event as RawEvent).error),
       skillName: linked?.skillName,
       skillPath: linked?.skillPath,
     });
+  });
+
+  api.on("agent_end", async (event, ctx: RawContext) => {
+    await nudgeObservationChain;
+    finishNudgesForAgentEnd(event as RawEvent, ctx);
   });
 
   api.on("message_received", async (event, ctx: RawContext) => {
@@ -3054,8 +3675,24 @@ export default definePluginEntry({
     }
   }
 
+  function finalizeAllPendingNudges(reason: string): void {
+    for (const nudge of [...pendingNudges.values()]) {
+      if (nudge.outcome === "nudged") {
+        nudge.coverage = "insufficient";
+        queueNudgeOutcomeUpdate(nudge, "unknown", `${reason}_without_terminal_hook`, undefined, {
+          eventKey: `${nudge.nudgeId}\0${reason}\0unknown`,
+          eventType: "unknown",
+        });
+      }
+      nudge.ended = true;
+      pendingNudges.delete(nudge.nudgeId);
+    }
+  }
+
   const shutdownParticipant: SharedShutdownParticipant = {
-    flush: (reason: string) => {
+    flush: async (reason: string) => {
+      await nudgeObservationChain;
+      finalizeAllPendingNudges(reason);
       finalizeAllExecutions(reason);
     },
   };
@@ -3065,7 +3702,7 @@ export default definePluginEntry({
   async function flushPendingWrites(reason: string): Promise<void> {
     for (const participant of [...sharedState.shutdownParticipants]) {
       try {
-        participant.flush(reason);
+        await participant.flush(reason);
       } catch (err) {
         log.error(`skill-usage-audit: shutdown finalize failed: ${String(err)}`);
       }
