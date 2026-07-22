@@ -52,7 +52,7 @@
     "@openclaw/plugin-inspector": "^0.3.10",
     "knip": "^6.27.0",
     "openclaw": "2026.5.3",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   },
   "optionalDependencies": {
     "better-sqlite3": ">=11.0.0"
