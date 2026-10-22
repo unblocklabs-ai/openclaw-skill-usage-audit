@@ -50,8 +50,9 @@
   },
   "devDependencies": {
     "@openclaw/plugin-inspector": "^0.3.10",
+    "@types/node": "^24.19.2",
     "knip": "^6.27.0",
-    "openclaw": "2026.5.3",
+    "openclaw": "2026.10.5",
     "typescript": "^5.9.3"
   },
   "optionalDependencies": {
@@ -86,5 +87,11 @@
       "publishToClawHub": false,
       "publishToNpm": true
     }
+  },
+  "overrides": {
+    "follow-redirects": "^1.16.1",
+    "hono": "^4.13.11",
+    "markdown-it": "^14.3.3",
+    "@modelcontextprotocol/sdk": "^1.32.0"
   }
 }
