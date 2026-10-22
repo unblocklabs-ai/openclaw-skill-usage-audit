@@ -52,7 +52,7 @@
     "@openclaw/plugin-inspector": "^0.3.10",
     "@types/node": "^24.19.2",
     "knip": "^6.27.0",
-    "openclaw": "2026.6.6",
+    "openclaw": "2026.10.5",
     "typescript": "^5.9.3"
   },
   "optionalDependencies": {
